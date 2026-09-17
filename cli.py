@@ -1,9 +1,9 @@
 """Command-line entry point for the idea-finder pipeline.
-
 Subcommands mirror the architecture (context/SYSTEM_DESIGN.md):
 collect|extract|cluster|score|run|status|captcha|llm-test. Pipeline stages
-are wired to :mod:`idea_finder.core.pipeline`; captcha and llm-test only
-print their purpose until fetch/browser.py and the LLM client land.
+are wired to :mod:`idea_finder.core.pipeline`; llm-test smokes the active
+LLM provider through the :mod:`idea_finder.llm.client` factory; captcha
+only prints its purpose until fetch/browser.py lands.
 """
 
 import argparse
@@ -16,6 +16,9 @@ from psycopg import Connection
 from idea_finder import __version__
 from idea_finder.core import pipeline
 from idea_finder.db.bootstrap_pgserver import DbError, ensure_pgserver
+from idea_finder.db.migrate import apply_migrations
+from idea_finder.db.repo import get_active_llm_provider
+from idea_finder.llm.client import LlmError, build_llm_client, estimate_cost
 
 LOGGER = logging.getLogger(__name__)
 
@@ -78,6 +81,25 @@ def _run_stage_command(stage_names: tuple[str, ...]) -> int:
     return 0
 
 
+def _cmd_llm_test() -> int:
+    """Smoke the active LLM provider: one fixed prompt, human-readable report."""
+    with _open_connection() as conn:
+        # Idempotent: a fresh cluster gets the schema here; an existing one
+        # skips everything already applied.
+        apply_migrations(conn)
+        provider = get_active_llm_provider(conn)
+        client = build_llm_client(conn)
+    prompt = "Smoke test: name one recurring pain of small businesses in Russia."
+    completion = client.complete(prompt)
+    cost = estimate_cost(completion, provider.price_per_mtok if provider else None)
+    print(f"provider: {completion.provider_name}")
+    print(f"model: {completion.model}")
+    print(f"answer: {completion.text[:80]}")
+    print(f"tokens: prompt={completion.prompt_tokens} completion={completion.completion_tokens}")
+    print(f"cost: {cost:.4f}")
+    return 0
+
+
 def _cmd_status(conn: Connection) -> int:
     """Print per-table counters over direct SQL (read-only status view)."""
     table_names = (
@@ -126,7 +148,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         _build_parser().print_help()
         return 0
-    LOGGER.debug("dispatching command=%s", args.command)
     try:
         if args.command in _STAGES:
             return _run_stage_command((args.command,))
@@ -135,10 +156,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "status":
             with _open_connection() as conn:
                 return _cmd_status(conn)
+        if args.command == "llm-test":
+            return _cmd_llm_test()
     except DbError:
         LOGGER.exception("command=%s failed", args.command)
         return 1
-    # captcha / llm-test: purpose-only until their subsystems land.
+    except LlmError:
+        LOGGER.exception("command=%s: LLM call failed", args.command)
+        return 1
+    # captcha: purpose-only until fetch/browser.py lands.
     print(args.purpose)
     return 0
 

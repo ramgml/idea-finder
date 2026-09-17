@@ -66,10 +66,10 @@ def _make_post(source_id: str, url: str) -> RawPost:
 
 
 def test_migrations_apply_to_clean_database(pg: PgHandle) -> None:
-    """001 on a fresh database: schema objects + version bookkeeping exist."""
+    """All migrations on a fresh database: schema objects + versions exist."""
     with pg.get_conn() as fresh:
         newly = apply_migrations(fresh)
-        assert newly == [1]
+        assert newly == [1, 2]
         tables = {
             row[0]
             for row in fresh.execute(
@@ -92,8 +92,8 @@ def test_migrations_apply_to_clean_database(pg: PgHandle) -> None:
 
 def test_migrations_reapply_is_noop(conn: Connection) -> None:
     """Re-running migrations on an already-migrated database changes nothing."""
-    assert apply_migrations(conn) == []  
-    assert applied_versions(conn) == {1}  
+    assert apply_migrations(conn) == []
+    assert applied_versions(conn) == {1, 2}
 
 
 def test_insert_raw_post_deduplicates_on_url_canon(conn: Connection) -> None:
