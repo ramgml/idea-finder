@@ -148,7 +148,10 @@ def render_extract_prompt(post_text: str, max_pains: int = _DEFAULT_MAX_PAINS) -
 class _ParseOutcome:
     """Intermediate parse result before anti-hallucination filtering."""
 
-    raw_pains: list[dict[str, object]]
+    #: Every entry of the pains list, dicts and non-dicts alike: the caller
+    #: counts non-dict entries as schema violations instead of dropping
+    #: them silently.
+    raw_pains: list[object]
     degraded_parse: bool
 
 
@@ -191,7 +194,7 @@ def _extract_json_payload(text: str) -> _ParseOutcome:
     if not isinstance(pains, list):
         raise InvalidResponseError("model answer JSON has no pains list")
     return _ParseOutcome(
-        raw_pains=[p for p in pains if isinstance(p, dict)],
+        raw_pains=pains,
         degraded_parse=fenced,
     )
 
@@ -235,6 +238,9 @@ def parse_extract_response(
     stats.degraded_parse += outcome.degraded_parse
     pains: list[Pain] = []
     for raw in outcome.raw_pains:
+        if not isinstance(raw, dict):
+            stats.schema_invalid += 1
+            continue
         extracted, extra = _validate_pain_shape(raw)
         if extracted is None:
             stats.schema_invalid += 1
@@ -310,23 +316,18 @@ def _load_fixture_pains() -> list[tuple[str, dict[str, object]]]:
 
 
 def _post_text_from_prompt(prompt: str, pairs: list[tuple[str, dict[str, object]]]) -> str:
-    """Recover the post text from a rendered prompt by longest-quote anchor.
+    """Recover the post text from a rendered extract prompt.
 
-    The fake client does not re-render the template; instead it locates the
-    longest fixture quote that occurs verbatim in the prompt (only the
-    template would place fixture quotes there, joined with the post text)
-    and returns everything from that anchor to the end. Raises
-    ``InvalidResponseError`` when no fixture quote is found — a prompt the
-    fixtures cannot answer is a caller bug, not an empty answer.
+    The rendered prompt ends with a fixed header line followed by the post
+    text itself, so the post is everything after the last occurrence of
+    that header. A prompt without the header was not produced by
+    :func:`render_extract_prompt` — a caller bug, hence the exception.
+    ``pairs`` is unused; it keeps the scanner seam symmetrical for tests.
     """
-    best_quote = ""
-    best_index = -1
-    for quote, _ in pairs:
-        index = prompt.find(quote)
-        if index >= 0 and len(quote) > len(best_quote):
-            best_quote, best_index = quote, index
-    if best_index < 0:
-        raise InvalidResponseError("prompt does not contain any fixture quote to anchor on")
-    return prompt[best_index:]
+    marker = "Текст поста:"
+    index = prompt.rfind(marker)
+    if index < 0:
+        raise InvalidResponseError("prompt was not rendered by render_extract_prompt")
+    return prompt[index + len(marker) :].strip()
 
 
