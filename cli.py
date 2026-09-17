@@ -3,7 +3,8 @@ Subcommands mirror the architecture (context/SYSTEM_DESIGN.md):
 collect|extract|cluster|score|run|status|captcha|llm-test. Pipeline stages
 are wired to :mod:`idea_finder.core.pipeline`; llm-test smokes the active
 LLM provider through the :mod:`idea_finder.llm.client` factory; captcha
-only prints its purpose until fetch/browser.py lands.
+opens a headed browser on a domain so a human can solve it once, with the
+session kept in the persistent per-domain profile (fetch/browser.py).
 """
 
 import argparse
@@ -18,6 +19,7 @@ from idea_finder.core import pipeline
 from idea_finder.db.bootstrap_pgserver import DbError, ensure_pgserver
 from idea_finder.db.migrate import apply_migrations
 from idea_finder.db.repo import get_active_llm_provider
+from idea_finder.fetch.browser import captcha_command
 from idea_finder.llm.client import LlmError, build_llm_client, estimate_cost
 
 LOGGER = logging.getLogger(__name__)
@@ -164,9 +166,11 @@ def main(argv: list[str] | None = None) -> int:
     except LlmError:
         LOGGER.exception("command=%s: LLM call failed", args.command)
         return 1
-    # captcha: purpose-only until fetch/browser.py lands.
-    print(args.purpose)
-    return 0
+    if args.command == "captcha":
+        return captcha_command(args.domain)
+    # Unreachable: argparse rejects unknown commands before dispatch.
+    _build_parser().error(f"unknown command: {args.command}")
+    return 2
 
 
 if __name__ == "__main__":
