@@ -61,4 +61,4 @@ Post-MVP петли (по нарастающей, каждая через кно
 Не делаем: автоправку промптов LLM'ом, онлайн-переобучение эмбеддингов.
 
 ## Процесс агентов (2026-09-17)
-AGENTS.md в корне — конвенции для воркеров (структура, гейты ruff+ty+pytest, worktree per task, DoD-бинарный, секреты). .omp/ORCHESTRATOR.md + .omp/agents/pm.md — роли оркестратора и PM. Очередь: 25 задач T294–T318 в Orenda #15 с зависимостями; LLM мокается (FakeLlmClient = провайдер kind=fake, is_default).
+AGENTS.md в корне — конвенции для воркеров (структура, гейты ruff+ty+pytest, worktree per task, DoD-бинарный, секреты). Git-модель: main (интеграционная, мерж --no-ff владельцем) + task-<N>-<slug> worktree на задачу; dev сознательно нет (≤2 воркеров). Ремоут: https://github.com/ramgml/idea-finder — ПУБЛИЧНЫЙ (создан 2026-09-17, main запушен); правило публичности: секреты только в gitignored путях/БД, утечка = немедленная ротация; хуки появятся с Makefile (A1). .omp/ORCHESTRATOR.md + .omp/agents/pm.md — роли оркестратора и PM. Очередь: 25 задач T294–T318 в Orenda #15 с зависимостями; LLM мокается (FakeLlmClient = провайдер kind=fake, is_default).
