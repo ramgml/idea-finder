@@ -314,12 +314,17 @@ def create_run(conn: Connection, stages: dict[str, str] | None = None,
 
 def update_run_stage(conn: Connection, run_id: str, stage: str, status: str,
                      stats_delta: dict[str, int] | None = None,
-                     cost_delta: float = 0.0) -> None:
+                     cost_delta: float = 0.0,
+                     prompt_version_id: str | None = None) -> None:
     """Record stage progress on a run.
 
     ``stage``/``status`` merge into ``stages_json``; ``stats_delta`` adds into
     the per-run counters (e.g. ``{"bricked": 1}``); ``cost_delta`` accrues on
     ``run.cost`` so repeated stage calls accumulate spent money.
+    ``prompt_version_id`` pins the prompt version used by the stage: it is
+    recorded once via COALESCE (OR-semantics) - a later call passing None
+    never overwrites an already recorded version, so a run stays
+    reproducible even when retries race with a prompt bump.
     """
     with conn.transaction():
         cursor = conn.execute(
@@ -327,13 +332,16 @@ def update_run_stage(conn: Connection, run_id: str, stage: str, status: str,
             UPDATE run SET
                 stages_json = stages_json || %s::jsonb,
                 stats_json = _stats_merge(stats_json, %s::jsonb),
-                cost = cost + %s
+                cost = cost + %s,
+                prompt_version_id = COALESCE(run.prompt_version_id,
+                                             %s::uuid)
             WHERE id = %s
             """,
             (
                 json.dumps({stage: status}),
                 json.dumps(stats_delta or {}),
                 cost_delta,
+                prompt_version_id,
                 run_id,
             ),
         )
@@ -412,27 +420,35 @@ def get_active_llm_provider(conn: Connection) -> LlmProviderRecord | None:
 
 
 def _run_from_row(row: tuple[object, ...]) -> Run:
-    """Build a domain Run from a run-table row (id, stages_json, stats_json, cost).
+    """Build a domain Run from a run-table row.
 
-    psycopg decodes ``jsonb`` columns to ``dict`` already; the ``str`` path
-    covers drivers/tests that hand back raw text.
+    Columns: (id, stages_json, stats_json, cost[, prompt_version_id]) - the
+    optional trailing column is accepted so callers may select it when they
+    care about the pinned prompt version. psycopg decodes ``jsonb`` columns
+    to ``dict`` already; the ``str`` path covers drivers/tests that hand back
+    raw text.
     """
     stages_raw, stats_raw, cost_raw = row[1], row[2], row[3]
     stages = stages_raw if isinstance(stages_raw, dict) else json.loads(str(stages_raw or "{}"))
     stats = stats_raw if isinstance(stats_raw, dict) else json.loads(str(stats_raw or "{}"))
     cost = float(cost_raw) if isinstance(cost_raw, (int, float, Decimal)) else 0.0
+    prompt_version_id = str(row[4]) if len(row) > 4 and row[4] is not None else None
     return Run(
         stages={str(k): str(v) for k, v in stages.items()},
         stats={str(k): int(v) for k, v in stats.items()},
         cost=cost,
         id=str(row[0]),
+        prompt_version_id=prompt_version_id,
     )
 
 
 def get_run(conn: Connection, run_id: str) -> Run | None:
     """Return a run as a domain object, or None when the id is unknown."""
     row = conn.execute(
-        "SELECT id, stages_json, stats_json, cost FROM run WHERE id = %s",
+        """
+        SELECT id, stages_json, stats_json, cost, prompt_version_id
+        FROM run WHERE id = %s
+        """,
         (run_id,),
     ).fetchone()
     return _run_from_row(row) if row is not None else None
