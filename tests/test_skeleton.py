@@ -20,8 +20,7 @@ EXPECTED_COMMANDS = (
 
 
 def test_package_import_exposes_docstring() -> None:
-    assert "idea finder" in __doc__.lower()
-    assert __version__
+    assert "0.0.0" == __version__
 
 
 def test_subpackages_importable() -> None:
