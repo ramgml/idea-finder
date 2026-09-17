@@ -11,6 +11,8 @@ dependencies = [
     "psycopg[binary]>=3.1",
     # OpenAI-compatible LLM client (idea_finder.llm.client).
     "httpx>=0.27",
+    # Local CPU embeddings (idea_finder.core.embed).
+    "sentence-transformers>=5.0",
 ]
 
 [dependency-groups]
