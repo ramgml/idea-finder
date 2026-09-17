@@ -62,6 +62,8 @@ class LlmProviderRecord:
     base_url: str
     model: str
     api_key: str
+    #: Blended price per 1M tokens (None = free or unknown; fake is always free).
+    price_per_mtok: Decimal | None
 
 
 def _embedding_literal(embedding: Sequence[float]) -> str:
@@ -311,14 +313,16 @@ def finish_run(conn: Connection, run_id: str) -> None:
 
 
 def upsert_llm_provider(conn: Connection, name: str, kind: str, base_url: str,
-                        model: str, api_key: str, *, is_active: bool) -> str:
+                        model: str, api_key: str, *, is_active: bool,
+                        price_per_mtok: Decimal | float | None = None) -> str:
     """Insert or update a provider; enforce exactly one active row.
 
     ``api_key`` is stored only in the database (project convention); it never
     goes to logs or .env. Activating this provider atomically deactivates the
     previously active one — the partial unique index makes two active rows
     impossible, and the UPDATE below runs before the INSERT to avoid tripping
-    it.
+    it. ``price_per_mtok`` is an optional blended tariff per 1M tokens used by
+    cost accounting; None (the default) means free or unknown.
     """
     with conn.transaction():
         if is_active:
@@ -327,17 +331,19 @@ def upsert_llm_provider(conn: Connection, name: str, kind: str, base_url: str,
             )
         row = conn.execute(
             """
-            INSERT INTO llm_provider (name, kind, base_url, model, api_key, is_active)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO llm_provider (name, kind, base_url, model, api_key,
+                                      is_active, price_per_mtok)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (name) DO UPDATE SET
                 kind = EXCLUDED.kind,
                 base_url = EXCLUDED.base_url,
                 model = EXCLUDED.model,
                 api_key = EXCLUDED.api_key,
-                is_active = EXCLUDED.is_active
+                is_active = EXCLUDED.is_active,
+                price_per_mtok = EXCLUDED.price_per_mtok
             RETURNING id
             """,
-            (name, kind, base_url, model, api_key, is_active),
+            (name, kind, base_url, model, api_key, is_active, price_per_mtok),
         ).fetchone()
     if row is None:
         msg = f"upsert_llm_provider returned no row for {name!r}"
@@ -349,15 +355,17 @@ def get_active_llm_provider(conn: Connection) -> LlmProviderRecord | None:
     """Return the single active provider, or None when nothing is active."""
     row = conn.execute(
         """
-        SELECT id, name, kind, base_url, model, api_key
+        SELECT id, name, kind, base_url, model, api_key, price_per_mtok
         FROM llm_provider WHERE is_active
-        """
+    """
     ).fetchone()
     if row is None:
         return None
+    price = row[6]
     return LlmProviderRecord(
         id=str(row[0]), name=str(row[1]), kind=str(row[2]),
         base_url=str(row[3]), model=str(row[4]), api_key=str(row[5]),
+        price_per_mtok=Decimal(price) if price is not None else None,
     )
 
 
