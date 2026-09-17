@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import subprocess
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -101,16 +102,21 @@ def _validate_unix_dsn(dsn: str) -> None:
     the DSN must name a socket directory and must not contain a TCP host or
     an explicit port component.
     """
-    if "host=localhost" in dsn or "host=127.0.0.1" in dsn or "host=::1" in dsn:
-        msg = f"dsn must not name a TCP host: {dsn!r}"
+    # A valid socket DSN always carries "?host=<absolute dir>"; anything
+    # else (TCP authority, hostname, missing host) is rejected outright.
+    marker = "?host="
+    index = dsn.rfind(marker)
+    if index == -1:
+        msg = f"dsn must carry a unix-socket host parameter: {dsn!r}"
+        raise DbError(msg)
+    socket_dir = dsn[index + len(marker) :]
+    if not socket_dir.startswith("/"):
+        msg = f"dsn host must be an absolute unix-socket directory, not TCP: {dsn!r}"
         raise DbError(msg)
     # A TCP port in a DSN always appears as "host=<something>:<port>" or an
     # explicit "port=" parameter; pgserver's socket DSN has neither.
     if "port=" in dsn:
         msg = f"dsn must not carry a TCP port: {dsn!r}"
-        raise DbError(msg)
-    if "?host=" not in dsn:
-        msg = f"dsn must carry a unix-socket host parameter: {dsn!r}"
         raise DbError(msg)
 
 
@@ -208,17 +214,32 @@ class PgHandle:
         return conn
 
     def stop(self) -> None:
-        """Stop the postgres server if the process is still alive."""
+        """Stop the postgres server (no-op if it is not running).
+
+        pgserver only stops the server itself when the last handle closes
+        with ``cleanup_mode='stop'``; our handles intentionally use
+        ``cleanup_mode=None`` so the server outlives the creating process,
+        so shutdown is done here with an explicit ``pg_ctl stop``.
+        """
         pid = self._server.get_pid()
         if pid is None:
             return
         try:
             os.kill(pid, 0)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             return
-        except PermissionError:
-            return
-        self._server.cleanup()
+        pg_ctl_bin = Path(pgserver.__file__).parent / "pginstall" / "bin" / "pg_ctl"
+        try:
+            subprocess.run(
+                [str(pg_ctl_bin), "-D", str(self._server.pgdata), "-w", "stop"],
+                check=True,
+                capture_output=True,
+                timeout=30,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            msg = f"failed to stop postgres in {self._server.pgdata}"
+            raise DbError(msg) from e
+        logger.info("stopped embedded postgres in %s", self._server.pgdata)
 
     def __enter__(self) -> Self:
         return self
