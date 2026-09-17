@@ -39,6 +39,7 @@ __all__ = [
     "insert_pain",
     "insert_raw_post",
     "insert_score",
+    "list_enabled_sources",
     "table_counts",
     "update_cluster_stats",
     "update_pain_embedding",
@@ -94,6 +95,24 @@ def ensure_source(conn: Connection, name: str) -> str:
         msg = f"ensure_source returned no row for {name!r}"
         raise RepoError(msg)
     return str(row[0])
+
+
+def list_enabled_sources(conn: Connection) -> list[tuple[str, float]]:
+    """Return ``(name, rate_limit_rps)`` for every enabled source, ordered by name.
+
+    The collect stage iterates adapters in this order and hands each rate to
+    its limiter (default 1 rps, migration 003). Disabled sources are skipped:
+    the collect stage must not touch a source an operator switched off.
+    """
+    rows = conn.execute(
+        """
+        SELECT name, rate_limit_rps
+        FROM source
+        WHERE enabled
+        ORDER BY name
+        """
+    ).fetchall()
+    return [(str(name), float(rate)) for name, rate in rows]
 
 
 def insert_raw_post(conn: Connection, post: RawPost, *, fetch_status: str = "new",
