@@ -86,15 +86,28 @@ uv run streamlit run idea_finder/web/streamlit_app.py   # дашборд
 4. **No silent scope reduction**: заблокированное/неясное — surface (в отчёте, `orenda agent propose`), не выбрасывать молча.
 5. **No stubs**: никакого `TODO: implement`, полей, которые никто не пишет, фейковых fallback'ов. Отложенный шов = отдельная задача в Orenda.
 
-## Workflow
+## Git workflow
+
+Модель: упрощённая, без dev — интеграционная ветка одна.
+
+- `main` — интеграционная, всегда рабочая. Прямые коммиты запрещены (исключение: стартовые docs-коммиты). Код попадает только через ветки задач; мерж — `--no-ff`, делает владелец после приёмки PM.
+- `task-<N>-<slug>` — ветка на задачу T<N> из Orenda. База: `origin/main` после fetch (пока ремоута нет — локальный `main`; после создания ремоута — только origin).
+- `dev` сознательно не заводим (≤2 параллельных воркера); если параллелизм вырастет — пересмотрим.
+- Worktree per task (без исключений): `git worktree add .worktrees/task-<N>-<slug> -b task-<N>-<slug>`. Главный checkout read-only: никаких правок и `git checkout/reset/clean/restore` в чужих чекаутах.
+- Коммиты: `task(<N>): short description` (N — номер задачи Orenda), маленькие и частые; незакоммиченный WIP не защищён.
+- Гейты перед «готово» (из корня worktree): `uv run ruff check . && uv run ty check . && uv run pytest`. После появления Makefile (задача A1) — хуки `make hooks` (pre-commit: ruff; pre-push: pytest); `--no-verify` запрещён.
+- Мерж: `--no-ff` в `main` силами владельца. Ветка после мержа: `git worktree remove .worktrees/task-<N>-<slug> && git worktree prune`.
+- Ремоут: пока отсутствует (локальный бэкап = коммиты). При создании (GitHub private) — `origin`, fetch перед ветвлением обязателен, база только `origin/main`.
+
+### Workflow
 
 1. Задача — из Orenda проект #15 (`orenda agent next --peek` — read-only; `next` клеймИТ).
 2. `orenda agent claim T<N>` → `orenda agent context T<N>` (постановка, DoD, UPDATE-пометки).
-3. Worktree per task: `git worktree add .worktrees/task-<N>-<slug> -b task-<N>-<slug>`. Главный checkout — read-only.
-4. Коммиты: `task(<N>): short description`; маленькие и частые.
-5. Гейты (из корня worktree): `uv run ruff check . && uv run ty check . && uv run pytest`.
-6. Готово → доклад владельцу/PM с доказательствами; мержит владелец. После мержа — `git worktree remove` + `prune`.
-7. Приёмка дашборда: `hub start review-t<N>` / `streamlit run` на свободном порту 21400–21499; потушить после приёмки.
+3. Worktree по схеме из Git workflow (ветка + worktree одной командой).
+4. Коммиты `task(<N>): ...` маленькие и частые.
+5. Гейты зелёные → доклад владельцу/PM с доказательствами (вывод команд, прогонов).
+6. Приёмка дашборда: `hub start review-t<N>` / `streamlit run` на свободном порту 21400–21499; потушить после приёмки.
+7. После мержа — удалить worktree (см. Git workflow).
 
 ### Секреты
 - LLM-ключи: в БД (`llm_provider`), заводятся через дашборд «Настройки LLM».
