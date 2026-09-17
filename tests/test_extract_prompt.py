@@ -386,41 +386,45 @@ def posts() -> list[dict[str, str]]:
 
 
 @pytest.fixture(scope="module")
-def annotated_posts(posts: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Only posts that expected_pains.json actually annotates."""
+def expected_pains() -> list[dict[str, object]]:
+    """The expected_pains.json annotation records, keyed by post_url."""
     fixture = resources.files("idea_finder").joinpath("fixtures/expected_pains.json")
-    entries = cast(
+    return cast(
         list[dict[str, object]], json.loads(fixture.read_text(encoding="utf-8"))
     )
-    annotated_urls = {str(e["post_url"]) for e in entries}
-    return [p for p in posts if p["url"] in annotated_urls]
 
 
 def test_acceptance_fixtures_extraction_meets_dod(
-    annotated_posts: list[dict[str, str]],
+    posts: list[dict[str, str]],
+    expected_pains: list[dict[str, object]],
 ) -> None:
-    """DoD gate on the annotated corpus (PM ruling, 2026-09-17).
+    """DoD gate on the full fixture corpus (T326: 32/32 annotated).
 
-    ``fixtures/expected_pains.json`` (T299 draft, owner-approved) annotates
-    24 of the 32 fixture posts; the other 8 have no markup at all. The DoD
-    gate therefore runs over the 24 annotated posts: >=80% must yield a
-    valid pain and zero hallucinated quotes are tolerated. Prints the brick
-    table the T307 stage gate consumes. Owner escalation for annotating the
-    remaining 8 posts is tracked outside this task.
+    ``fixtures/expected_pains.json`` covers every fixture post: either with
+    extracted pains or with the ``pains: []`` no-pain marker. The gate runs
+    over all posts: at least 80% must yield a valid pain and zero
+    hallucinated quotes are tolerated. A post without pain is legitimate —
+    the fake finds no matching quote and the parse yields zero pains.
+    Prints the brick table the T307 stage gate consumes. No corpus sizes are
+    hardcoded, so future re-annotation does not silently break the gate.
     """
+    annotated_urls = {str(e["post_url"]) for e in expected_pains}
+    assert annotated_urls == {p["url"] for p in posts}, (
+        "expected_pains.json must cover every fixture post (pains: [] for no pain)"
+    )
     client = FakeExtractLlmClient()
     total = ExtractStats()
     posts_with_valid_pain = 0
-    for post in annotated_posts:
+    for post in posts:
         prompt = render_extract_prompt(post["text"])
         answer = client.complete(prompt)
         pains, stats = parse_extract_response(answer, post["text"])
         total.add(stats)
         if pains:
             posts_with_valid_pain += 1
-    ratio = posts_with_valid_pain / len(annotated_posts)
+    ratio = posts_with_valid_pain / len(posts)
     print(
-        f"\nDoD acceptance over {len(annotated_posts)} annotated fixture posts: "
+        f"\nDoD acceptance over all {len(posts)} fixture posts: "
         f"posts_with_valid_pain={posts_with_valid_pain} "
         f"({ratio:.0%}), pains_accepted={total.valid}"
     )
@@ -432,37 +436,6 @@ def test_acceptance_fixtures_extraction_meets_dod(
     assert total.invalid_json == 0
     assert total.schema_invalid == 0
     assert ratio >= 0.8, f"only {ratio:.0%} of posts produced a valid pain (<80%)"
-
-
-def test_acceptance_run_over_all_fixture_posts_is_reported(
-    posts: list[dict[str, str]],
-) -> None:
-    """Full-corpus brick table for the report (no gate, facts only).
-
-    On the 8 unannotated posts the fake has no markup to draw from and the
-    parse yields zero pains; this test keeps the full-corpus numbers visible
-    so the annotated/total split cannot drift silently.
-    """
-    client = FakeExtractLlmClient()
-    total = ExtractStats()
-    posts_with_valid_pain = 0
-    for post in posts:
-        prompt = render_extract_prompt(post["text"])
-        answer = client.complete(prompt)
-        pains, stats = parse_extract_response(answer, post["text"])
-        total.add(stats)
-        if pains:
-            posts_with_valid_pain += 1
-    print(
-        f"\nFull corpus: posts_with_valid_pain={posts_with_valid_pain}/{len(posts)} "
-        "expected_pains.json annotates 24/32 (T299 draft); "
-        "gate runs on the annotated subset only."
-    )
-    print(
-        "full-corpus brick table: "
-        + json.dumps(extract_stats_to_dict(total), ensure_ascii=False)
-    )
-    assert posts_with_valid_pain == 24, "annotated-post coverage drifted"
 
 
 def test_acceptance_every_accepted_quote_is_verbatim_substring(
