@@ -9,7 +9,7 @@
 |---|---|---|---|---|
 | FL.ru | RSS лент заказов | demand | MVP-адаптер | T302 |
 | Habr | RSS по хабам + полный текст постов | discussion | MVP-адаптер | T303 |
-| Google Play (RU-отзывы) | google-play-scraper, без ключа | complaint | MVP-адаптер | T304 |
+| Google Play (RU-отзывы) | google-play-scraper, без ключа; **нужен VPN** (без него timeout) | complaint | адаптер готов (e2e); живой смоук — на G1 с включённым VPN | T304 |
 | Freelance.ru | RSS | demand | бэклог | — |
 | Habr Freelance | RSS | demand | бэклог | — |
 | Weblancer | RSS/API | demand | бэклог | — |
