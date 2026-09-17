@@ -8,7 +8,7 @@ extraction (:mod:`idea_finder.fetch.extract`).
 Politeness rules (AGENTS.md, sources rule 3):
 
 - requests to distinct hosts are throttled independently (aiolimiter
-  ``Limiter`` per domain, default 1 request/second, overridable per domain
+  ``AsyncLimiter`` per domain, default 1 request/second, overridable per domain
   via the ``rate_limits`` constructor argument sourced from
   ``source.rate_limit_rps``);
 - ``robots.txt`` is fetched once per domain (with its own short timeout)
@@ -73,13 +73,17 @@ class HttpFetcher:
         timeout_s: float = 20.0,
         rate_limits: dict[str, float] | None = None,
         respect_robots: bool = True,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        """``transport`` is an injection seam for tests (httpx.MockTransport);
+        production code leaves it as None for real network I/O."""
         self._timeout_s = timeout_s
         self._rate_limits = dict(rate_limits) if rate_limits else {}
         self._respect_robots = respect_robots
+        self._transport = transport
         # Lazy per-domain state: a domain's limiter/robots entries are
         # created on first request to it, so an unused source costs nothing.
-        self._limiters: dict[str, aiolimiter.Limiter] = {}
+        self._limiters: dict[str, aiolimiter.AsyncLimiter] = {}
         self._robots: dict[str, RobotFileParser | None] = {}
         self._client: httpx.AsyncClient | None = None
 
@@ -88,6 +92,7 @@ class HttpFetcher:
             headers={"User-Agent": REALISTIC_USER_AGENT},
             timeout=httpx.Timeout(self._timeout_s),
             follow_redirects=True,
+            transport=self._transport,
         )
         return self
 
@@ -96,12 +101,12 @@ class HttpFetcher:
             await self._client.aclose()
             self._client = None
 
-    def _limiter(self, domain: str) -> aiolimiter.Limiter:
+    def _limiter(self, domain: str) -> aiolimiter.AsyncLimiter:
         """Return the per-domain limiter, creating it lazily."""
         limiter = self._limiters.get(domain)
         if limiter is None:
             rate = self._rate_limits.get(domain, DEFAULT_RATE_RPS)
-            limiter = aiolimiter.Limiter(rate)
+            limiter = aiolimiter.AsyncLimiter(rate, 1.0)
             self._limiters[domain] = limiter
         return limiter
 
