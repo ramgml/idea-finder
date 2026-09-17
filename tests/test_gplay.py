@@ -11,6 +11,7 @@ Layers:
   ``insert_raw_post`` — first run inserts all 60, the re-run inserts 0
   (the DoD acceptance criterion: repeat adds only new reviews).
 """
+
 from __future__ import annotations
 
 import json
@@ -161,7 +162,11 @@ async def test_urls_are_unique_and_carry_the_review_fragment(
     posts = await adapter.fetch_new(None)
     assert len({post.url_canon for post in posts}) == len(posts)
     expected = _review_url("app.one", "review-0001")
-    assert posts[0].url == expected == "https://play.google.com/store/apps/details?id=app.one#review=review-0001"
+    assert (
+        posts[0].url
+        == expected
+        == "https://play.google.com/store/apps/details?id=app.one#review=review-0001"
+    )
     assert posts[0].url_canon == canonical_url(expected)
 
 
@@ -223,6 +228,66 @@ async def test_dead_app_does_not_sink_the_batch(
     assert "app.bad" in caplog.text
 
 
+async def test_network_failure_degrades_to_empty_batch_and_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Every app timing out degrades to [] with warnings, no exception.
+
+    Task T334 DoD: ``collect`` must survive an unreachable Google Play —
+    the adapter returns an empty harvest, logs one warning per app, and
+    bumps ``network_errors`` once per failed app.
+    """
+    adapter = GPlayAdapter(apps_path=_config(tmp_path, ["app.one", "app.two"]))
+
+    def timeout_reviews(app_id: str) -> list[dict[str, object]]:
+        raise TimeoutError(f"read timed out for {app_id}")
+
+    monkeypatch.setattr(adapter, "_fetch_reviews", timeout_reviews)
+    with caplog.at_level("WARNING"):
+        posts = await adapter.fetch_new(None)
+    assert posts == []
+    assert adapter.network_errors == 2
+    assert "TimeoutError" in caplog.text
+    assert "app.one" in caplog.text and "app.two" in caplog.text
+
+
+async def test_one_network_failure_keeps_healthy_apps_and_counts_one(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A single network-failing app is skipped and counted; the rest survive."""
+    reviews_by_app = {"app.good": _six_complaints(start_index=1)}
+    adapter = GPlayAdapter(apps_path=_config(tmp_path, ["app.down", "app.good"]))
+
+    def flaky_reviews(app_id: str) -> list[dict[str, object]]:
+        if app_id == "app.down":
+            raise ConnectionError("name resolution failed")
+        return reviews_by_app[app_id]
+
+    monkeypatch.setattr(adapter, "_fetch_reviews", flaky_reviews)
+    posts = await adapter.fetch_new(None)
+    assert [post.text for post in posts] == list(_COMPLAINTS)
+    assert adapter.network_errors == 1
+
+
+async def test_config_error_from_seam_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """GPlayConfigError crossing the seam propagates instead of degrading."""
+    adapter = GPlayAdapter(apps_path=_config(tmp_path, ["app.broken"]))
+
+    def broken_reviews(app_id: str) -> list[dict[str, object]]:
+        raise GPlayConfigError(f"unreachable config seam for {app_id}")
+
+    monkeypatch.setattr(adapter, "_fetch_reviews", broken_reviews)
+    with pytest.raises(GPlayConfigError):
+        await adapter.fetch_new(None)
+    assert adapter.network_errors == 0
+
+
 async def test_missing_config_raises_gplay_config_error(tmp_path: Path) -> None:
     """A missing config file is GPlayConfigError (a FetchError subtype)."""
     adapter = GPlayAdapter(apps_path=tmp_path / "absent.json")
@@ -277,10 +342,7 @@ def conn(pg: PgHandle) -> Iterator[Connection]:
 
 def _ten_app_reviews() -> dict[str, list[dict[str, object]]]:
     """DoD fixture: 10 apps x 6 complaint reviews = 60 reviews total."""
-    return {
-        f"ru.test.app{n}": _six_complaints(start_index=n * 100)
-        for n in range(1, 11)
-    }
+    return {f"ru.test.app{n}": _six_complaints(start_index=n * 100) for n in range(1, 11)}
 
 
 async def test_dod_first_run_inserts_sixty_second_run_zero(
