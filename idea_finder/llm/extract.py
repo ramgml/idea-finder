@@ -30,9 +30,11 @@ __all__ = [
     "InvalidResponseError",
     "PromptTemplateError",
     "extract_stats_to_dict",
+    "load_extract_template",
     "parse_extract_response",
     "render_extract_prompt",
 ]
+
 
 #: Name the extract prompt is registered under (prompt_version table).
 PROMPT_NAME = "extract_pains"
@@ -124,6 +126,16 @@ def _load_template() -> str:
     except (FileNotFoundError, ModuleNotFoundError) as e:
         msg = "extract prompt template idea_finder/llm/prompts/extract_pains.md is missing"
         raise PromptTemplateError(msg) from e
+
+
+def load_extract_template() -> str:
+    """Return the raw extract prompt template (the versioned artifact).
+
+    The extract stage registers this exact text under ``(PROMPT_NAME,
+    PROMPT_VERSION)`` in the ``prompt_version`` table once per run, so a
+    run stays reproducible against the shipped prompt source.
+    """
+    return _load_template()
 
 
 def render_extract_prompt(post_text: str, max_pains: int = _DEFAULT_MAX_PAINS) -> str:

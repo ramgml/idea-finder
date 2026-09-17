@@ -40,6 +40,8 @@ __all__ = [
     "insert_raw_post",
     "insert_score",
     "list_enabled_sources",
+    "list_posts_pending_extract",
+    "set_raw_post_fetch_status",
     "table_counts",
     "update_cluster_stats",
     "update_pain_embedding",
@@ -452,6 +454,52 @@ def get_run(conn: Connection, run_id: str) -> Run | None:
         (run_id,),
     ).fetchone()
     return _run_from_row(row) if row is not None else None
+
+
+def list_posts_pending_extract(conn: Connection,
+                               limit: int | None = None) -> list[tuple[str, str]]:
+    """Return ``(post_id, body)`` for posts awaiting pain extraction.
+
+    A post is pending when it has no pain yet AND its fetch status is
+    ``'new'``/``'fetched'`` (COALESCE covers rows written before status
+    tracking). Posts with ``'failed'`` are bricked by contract: the extract
+    stage marks hopeless answers once and never retries them, so repeated
+    runs converge instead of burning tokens on the same garbage.
+    """
+    sql = """
+        SELECT p.id::text, p.body
+        FROM raw_post p
+        LEFT JOIN pain ON pain.raw_post_id = p.id
+        WHERE pain.id IS NULL
+          AND COALESCE(p.fetch_status, 'new') IN ('new', 'fetched')
+        ORDER BY p.created_at
+    """
+    if limit is not None:
+        sql += f" LIMIT {int(limit)}"
+    rows = conn.execute(sql).fetchall()
+    return [(str(row[0]), str(row[1])) for row in rows]
+
+
+def set_raw_post_fetch_status(conn: Connection, post_id: str,
+                              status: str) -> None:
+    """Set a post's ``fetch_status`` ('fetched' or 'failed').
+
+    The extract stage pins each attempted post: 'fetched' when an answer was
+    processed (even with zero accepted pains), 'failed' when the answer is
+    hopeless (unparseable JSON) and must not be retried. Raises
+    :class:`RepoError` on an unknown post id or an invalid status value.
+    """
+    if status not in {"fetched", "failed"}:
+        msg = f"invalid fetch_status: {status!r} (expected 'fetched' or 'failed')"
+        raise RepoError(msg)
+    with conn.transaction():
+        cursor = conn.execute(
+            "UPDATE raw_post SET fetch_status = %s WHERE id = %s",
+            (status, post_id),
+        )
+        if cursor.rowcount == 0:
+            msg = f"raw_post not found: {post_id}"
+            raise RepoError(msg)
 
 
 def table_counts(conn: Connection) -> dict[str, int]:
