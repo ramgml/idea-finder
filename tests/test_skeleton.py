@@ -1,9 +1,8 @@
 """Tests for the project skeleton: package import and CLI surface."""
 
+import importlib
 import subprocess
 import sys
-
-import pytest
 
 from idea_finder import __version__
 
@@ -21,12 +20,15 @@ EXPECTED_COMMANDS = (
 
 def test_package_import_exposes_docstring() -> None:
     assert "0.0.0" == __version__
+    import idea_finder
+
+    assert idea_finder.__doc__ is not None
 
 
 def test_subpackages_importable() -> None:
     for name in ("sources", "fetch", "llm", "core", "db", "web"):
-        module = pytest.importorskip(f"idea_finder.{name}")
-        assert module.__doc__
+        module = importlib.import_module(f"idea_finder.{name}")
+        assert module.__doc__ is not None
 
 
 def run_cli(*arguments: str) -> subprocess.CompletedProcess[str]:
