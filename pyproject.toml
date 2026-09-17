@@ -19,6 +19,8 @@ dependencies = [
     "playwright>=1.45",
     # Google Play RU reviews (idea_finder.sources.gplay).
     "google-play-scraper>=1.2.7",
+    # Prompt templates (idea_finder.llm.prompts, idea_finder.llm.extract).
+    "jinja2>=3.1",
 ]
 
 [dependency-groups]
@@ -29,9 +31,19 @@ dev = [
     "ty>=0.0.1a5",
 ]
 
+
+# Regression fixtures for the fake LLM client live at the repo root in dev,
+# but the deterministic fake client resolves them relative to the installed
+# package, so they ship inside idea_finder/fixtures/. hatchling's `packages`
+# already carries every non-Python file under idea_finder/ (verified: .md
+# prompt templates land in the wheel without extra config).
+[tool.hatch.build.targets.wheel.force-include]
+"fixtures" = "idea_finder/fixtures"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
 
 [tool.hatch.build.targets.wheel]
 packages = ["idea_finder"]
