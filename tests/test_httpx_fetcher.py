@@ -6,6 +6,7 @@ the fetcher's ``transport`` seam) — no real requests are made."""
 from __future__ import annotations
 
 from collections.abc import Callable
+from typing import Any, TypedDict, cast
 
 import httpx
 import pytest
@@ -19,12 +20,24 @@ from idea_finder.fetch.httpx_fetcher import (
     sanitize_domain,
 )
 
+
+class HttpFetcherOptions(TypedDict, total=False):
+    """Keyword options of :class:`HttpFetcher` accepted by the test helper."""
+
+    timeout_s: float
+    rate_limits: dict[str, float]
+    respect_robots: bool
+
+
 Handler = Callable[[httpx.Request], httpx.Response]
 
 
-async def _fetch_with(handler: Handler, url: str, **kwargs: object) -> str:
+
+
+async def _fetch_with(handler: Handler, url: str, **kwargs: Any) -> str:
     """Run one fetch against a mock transport and return the body text."""
-    async with HttpFetcher(transport=httpx.MockTransport(handler), **kwargs) as fetcher:  # type: ignore[arg-type]
+    options = cast(HttpFetcherOptions, kwargs)
+    async with HttpFetcher(transport=httpx.MockTransport(handler), **options) as fetcher:
         return await fetcher.fetch(url)
 
 

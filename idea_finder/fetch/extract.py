@@ -34,6 +34,8 @@ def _selectolax_fallback(html: str) -> str:
     for node in tree.css("script, style, noscript"):
         node.decompose()
     body = tree.body or tree.root
+    if body is None:
+        return ""
     return body.text(separator=" ", strip=True)
 
 
