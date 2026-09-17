@@ -182,6 +182,10 @@ class GPlayAdapter:
             except Exception as e:
                 # Degrade gracefully (task T334): a timeout or any other
                 # network/scraper failure is logged as a warning, the app
+                # is skipped, and the network error counter is bumped so
+                # callers can fold it into run statistics. collect() must
+                # survive a fully unreachable network.
+                self.network_errors += 1
                 logger.warning(
                     "gplay: app %s failed, skipped: %s: %s",
                     app_id,
