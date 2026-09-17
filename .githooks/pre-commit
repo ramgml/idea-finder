@@ -1,0 +1,3 @@
+#!/bin/sh
+# Pre-commit gate: lint.
+exec make lint
