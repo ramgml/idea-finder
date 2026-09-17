@@ -41,6 +41,7 @@ __all__ = [
     "insert_score",
     "table_counts",
     "update_cluster_stats",
+    "update_pain_embedding",
     "update_run_stage",
     "upsert_cluster",
     "upsert_llm_provider",
@@ -221,6 +222,28 @@ def update_cluster_stats(conn: Connection, cluster_id: str, size: int,
         if cursor.rowcount == 0:
             msg = f"cluster not found: {cluster_id}"
             raise RepoError(msg)
+
+
+def update_pain_embedding(conn: Connection, pain_id: str,
+                          embedding: Sequence[float]) -> None:
+    """Store the e5 vector for an existing pain (embed stage backfill).
+
+    Formats the vector as pgvector's text literal and casts it on the
+    server side, same as :func:`insert_pain`. Raises :class:`RepoError`
+    when the pain id is unknown.
+    """
+    with conn.transaction():
+        row = conn.execute(
+            """
+            UPDATE pain SET embedding = (%s::text)::vector
+            WHERE id = %s
+            RETURNING id
+            """,
+            (_embedding_literal(embedding), pain_id),
+        ).fetchone()
+    if row is None:
+        msg = f"update_pain_embedding: unknown pain id {pain_id}"
+        raise RepoError(msg)
 
 
 def insert_score(conn: Connection, score: Score) -> str:
