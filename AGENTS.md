@@ -96,8 +96,7 @@ uv run streamlit run idea_finder/web/streamlit_app.py   # дашборд
 - Worktree per task (без исключений): `git worktree add .worktrees/task-<N>-<slug> -b task-<N>-<slug>`. Главный checkout read-only: никаких правок и `git checkout/reset/clean/restore` в чужих чекаутах.
 - Коммиты: `task(<N>): short description` (N — номер задачи Orenda), маленькие и частые; незакоммиченный WIP не защищён.
 - Гейты перед «готово» (из корня worktree): `uv run ruff check . && uv run ty check . && uv run pytest`. После появления Makefile (задача A1) — хуки `make hooks` (pre-commit: ruff; pre-push: pytest); `--no-verify` запрещён.
-- Мерж: `--no-ff` в `main` силами владельца. Ветка после мержа: `git worktree remove .worktrees/task-<N>-<slug> && git worktree prune`.
-- Ремоут: пока отсутствует (локальный бэкап = коммиты). При создании (GitHub private) — `origin`, fetch перед ветвлением обязателен, база только `origin/main`.
+- Ремоут: GitHub, **публичный**. `origin` + fetch перед ветвлением обязательны, база только `origin/main`. Секреты в git не попадают никогда (см. «Секреты»); при утечке — немедленная ротация (история публична, отзыва ключа недостаточно). Пуш `main` и `task-*` — владелец или его прямое указание.
 
 ### Workflow
 
@@ -112,7 +111,7 @@ uv run streamlit run idea_finder/web/streamlit_app.py   # дашборд
 ### Секреты
 - LLM-ключи: в БД (`llm_provider`), заводятся через дашборд «Настройки LLM».
 - `.env` (только `PGDATA_DIR` и будущая локальная конфигурация) и `.orenda/` — gitignored, 600.
-- Ключ в коде/коммите/логе — инцидент: ротация + доклад.
+- Ключ в коде/коммите/логе — инцидент: немедленная ротация + доклад владельцу (репо публичный — считай ключ скомпрометированным с момента пуша).
 
 ### Что НЕ делать
 - ❌ Не писать в БД мимо `db/repo.py`.
