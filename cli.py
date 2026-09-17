@@ -77,6 +77,9 @@ def _open_connection() -> Connection:
 def _run_stage_command(stage_names: tuple[str, ...]) -> int:
     """Run the named stages in order on one connection, print each stats dict."""
     with _open_connection() as conn:
+        # Idempotent like llm-test: a fresh cluster gets the schema before
+        # the first stage touches prompt_version/run tables.
+        apply_migrations(conn)
         for name in stage_names:
             stats = _STAGES[name](conn)
             print(f"{name}: {stats}")

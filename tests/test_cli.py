@@ -48,23 +48,34 @@ def test_stage_command_prints_skeleton_stats(pgdata_dir: Path, stage: str) -> No
     del pgdata_dir  # only ensures PGDATA_DIR is set for the subprocess
     result = run_cli(stage)
     assert result.returncode == 0, result.stderr
-    assert f"{stage}: {{'rows': 0}}" in result.stdout
+    if stage == "extract":
+        # Real stage: empty database -> zero counters, no LLM provider needed.
+        assert "extract: {'processed': 0," in result.stdout
+    else:
+        assert f"{stage}: {{'rows': 0}}" in result.stdout
 
 
 def test_run_executes_all_stages_in_order(pgdata_dir: Path) -> None:
     del pgdata_dir
     result = run_cli("run")
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines()[-4:] == [
-        "collect: {'rows': 0}",
-        "extract: {'rows': 0}",
-        "cluster: {'rows': 0}",
-        "score: {'rows': 0}",
-    ]
+    last4 = result.stdout.splitlines()[-4:]
+    # extract is real now (produces its own stats dict), other stages skeleton.
+    assert last4[0] == "collect: {'rows': 0}"
+    assert last4[1].startswith("extract: {'processed': 0,")
+    assert last4[2] == "cluster: {'rows': 0}"
+    assert last4[3] == "score: {'rows': 0}"
 
 
-def test_status_on_empty_database_reports_schema_not_applied(pgdata_dir: Path) -> None:
+def test_status_after_stages_reports_counters(pgdata_dir: Path) -> None:
+    """Stage commands apply migrations idempotently, so status sees tables.
+
+    Previously stages ran on a raw schema and ``status`` printed "schema
+    not applied" on this fresh cluster; the extract stage needs
+    prompt_version/run tables, so stage commands now migrate first.
+    """
     del pgdata_dir
     result = run_cli("status")
     assert result.returncode == 0, result.stderr
-    assert "schema not applied" in result.stdout
+    assert "schema not applied" not in result.stdout
+    assert "source: 0" in result.stdout and "pain: 0" in result.stdout

@@ -58,6 +58,11 @@ def run_extract(conn: Connection) -> StageStats:
     with hopeless answers), ``llm_errors``, plus the brick breakdown from
     :class:`ExtractStats` and ``cost_micro``.
     """
+    if not repo.list_posts_pending_extract(conn, limit=1):
+        # Nothing to do: no run row, no provider lookup, zero counters. A
+        # fresh cluster without an active LLM provider stays a no-op here.
+        return {"processed": 0, "extracted": 0, "failed": 0, "llm_errors": 0,
+                **extract_stats_to_dict(ExtractStats()), "cost_micro": 0}
     template = load_extract_template()
     prompt_version_id = repo.upsert_prompt_version(
         conn, PROMPT_NAME, PROMPT_VERSION, template, "file"
@@ -132,16 +137,32 @@ def _store_pains(conn: Connection, post_id: str, pains: list[Pain],
         )
 
 
+def _skeleton_stage(conn: Connection, name: str) -> StageStats:
+    """Shared skeleton body: own transaction, announce, zero counters."""
+    with conn.transaction():
+        LOGGER.info("stage %s not implemented", name)
+    return {"rows": 0}
+
+
 def run_collect(conn: Connection) -> StageStats:
-    """Fetch new posts from all enabled sources (task B-flow, pending)."""
-    raise NotImplementedError
+    """Fetch new posts from all enabled sources into ``raw_post``.
+
+    Implemented in task B-flow (source adapters).
+    """
+    return _skeleton_stage(conn, "collect")
 
 
 def run_cluster(conn: Connection) -> StageStats:
-    """Embed pains and group them into clusters (task D-flow, pending)."""
-    raise NotImplementedError
+    """Embed pains and group them into clusters.
+
+    Implemented in task D-flow (embeddings + grouping).
+    """
+    return _skeleton_stage(conn, "cluster")
 
 
 def run_score(conn: Connection) -> StageStats:
-    """Score clusters against the Russian-market rubric (task E-flow)."""
-    raise NotImplementedError
+    """Score clusters against the Russian-market rubric.
+
+    Implemented in task E-flow (market rubric).
+    """
+    return _skeleton_stage(conn, "score")

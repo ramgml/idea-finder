@@ -305,7 +305,7 @@ def test_fake_client_returns_parseable_json_for_fixture_post() -> None:
     post_text = str(post["text"])
     client = FakeExtractLlmClient()
     prompt = render_extract_prompt(post_text)
-    answer = client.complete(prompt)
+    answer = client.complete(prompt).text
     assert isinstance(answer, str)
     pains, stats = parse_extract_response(answer, post_text)
     assert stats.valid >= 1
@@ -316,7 +316,7 @@ def test_fake_client_is_deterministic() -> None:
     """Identical prompts give identical answers, twice in a row."""
     client = FakeExtractLlmClient()
     prompt = render_extract_prompt(SOURCE)
-    assert client.complete(prompt) == client.complete(prompt)
+    assert client.complete(prompt).text == client.complete(prompt).text
 
 
 def test_fake_client_rejects_prompt_without_post_header() -> None:
@@ -335,7 +335,7 @@ def test_fake_client_rejects_prompt_without_post_header() -> None:
 def test_fake_client_completion_shape_matches_protocol() -> None:
     """complete() output pairs with parse for a hand-made source too."""
     client = FakeExtractLlmClient()
-    answer = client.complete(render_extract_prompt(SOURCE))
+    answer = client.complete(render_extract_prompt(SOURCE)).text
     # SOURCE quotes the fixture pain verbatim, so the fake answers with it.
     pains, stats = parse_extract_response(answer, SOURCE)
     # SOURCE contains the fixture quote verbatim, so the fake answers with
@@ -417,7 +417,7 @@ def test_acceptance_fixtures_extraction_meets_dod(
     posts_with_valid_pain = 0
     for post in posts:
         prompt = render_extract_prompt(post["text"])
-        answer = client.complete(prompt)
+        answer = client.complete(prompt).text
         pains, stats = parse_extract_response(answer, post["text"])
         total.add(stats)
         if pains:
@@ -450,7 +450,7 @@ def test_acceptance_every_accepted_quote_is_verbatim_substring(
     client = FakeExtractLlmClient()
     for post in posts:
         prompt = render_extract_prompt(post["text"])
-        answer = client.complete(prompt)
+        answer = client.complete(prompt).text
         pains, _ = parse_extract_response(answer, post["text"])
         for pain in pains:
             assert pain.quote in post["text"], (
