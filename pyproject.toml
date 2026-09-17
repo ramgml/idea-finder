@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "Pain harvesting, clustering, and scoring pipeline for the Russian market"
 readme = "AGENTS.md"
 requires-python = ">=3.12, <3.13"
-# Runtime dependencies arrive with tasks B/C/D; the skeleton needs none.
+# Runtime dependencies; the skeleton started with none.
 dependencies = [
     "pgserver>=0.1.4",
     "pgvector>=0.3",
@@ -31,14 +31,6 @@ dev = [
     "ty>=0.0.1a5",
 ]
 
-
-# Regression fixtures for the fake LLM client live at the repo root in dev,
-# but the deterministic fake client resolves them relative to the installed
-# package, so they ship inside idea_finder/fixtures/. hatchling's `packages`
-# already carries every non-Python file under idea_finder/ (verified: .md
-# prompt templates land in the wheel without extra config).
-[tool.hatch.build.targets.wheel.force-include]
-"fixtures" = "idea_finder/fixtures"
 
 [build-system]
 requires = ["hatchling"]
