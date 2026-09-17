@@ -107,10 +107,15 @@ def test_expected_pain_quotes_are_verbatim_substrings(
             )
 
 
-def test_expected_pains_have_filled_fields() -> None:
+def test_expected_pains_entries_have_valid_shape() -> None:
+    """Every entry is an object with non-empty pains (or the no-pain marker).
+
+    ``pains: []`` is the legitimate 'this post expresses no pain' verdict;
+    pain entries must still carry filled body/audience/quote fields.
+    """
     data = json.loads((FIXTURES_DIR / "expected_pains.json").read_text(encoding="utf-8"))
     for entry in data:
-        assert entry["pains"], entry["post_url"]
+        assert isinstance(entry["pains"], list), entry["post_url"]
         for pain in entry["pains"]:
             assert pain["body"].strip(), entry["post_url"]
             assert pain["audience"].strip(), entry["post_url"]
