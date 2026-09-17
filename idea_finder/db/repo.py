@@ -22,6 +22,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import LiteralString, cast
 
 from psycopg import Connection
 
@@ -466,7 +467,7 @@ def list_posts_pending_extract(conn: Connection,
     tracking). Both terminal states exist so repeated runs converge instead
     of re-sending the same posts to the LLM forever.
     """
-    sql = """
+    sql: LiteralString = """
         SELECT p.id::text, p.body
         FROM raw_post p
         LEFT JOIN pain ON pain.raw_post_id = p.id
@@ -475,7 +476,7 @@ def list_posts_pending_extract(conn: Connection,
         ORDER BY p.created_at
     """
     if limit is not None:
-        sql += f" LIMIT {int(limit)}"
+        sql = cast(LiteralString, sql + f" LIMIT {int(limit)}")
     rows = conn.execute(sql).fetchall()
     return [(str(row[0]), str(row[1])) for row in rows]
 

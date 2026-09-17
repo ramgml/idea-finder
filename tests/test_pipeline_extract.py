@@ -212,7 +212,12 @@ def test_extract_llm_error_leaves_post_pending(
         def complete(self, prompt: str) -> Completion:
             raise LlmError("provider down")
 
-    _add_post(conn, "Мобильный банк падает при попытке оплатить ЖКХ")
+    fixture_text = json.loads(
+        resources.files("idea_finder")
+        .joinpath("fixtures/posts/fl_ru.json")
+        .read_text(encoding="utf-8")
+    )[0]["text"]
+    _add_post(conn, fixture_text)
     _use_client(conn, FailingClient(), monkeypatch)
 
     stats = run_extract(conn)

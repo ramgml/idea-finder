@@ -74,13 +74,16 @@ def run_extract(conn: Connection) -> StageStats:
     stats: ExtractStats = ExtractStats()
     counters = {"processed": 0, "extracted": 0, "failed": 0, "llm_errors": 0}
     cost_total = 0.0
-
+    seen: set[str] = set()  # per-run guard: LlmError posts stay pending,
+    # but one run must not re-send the same post to the provider forever.
     try:
         while True:
-            batch = repo.list_posts_pending_extract(conn, limit=50)
+            batch = [(pid, b) for pid, b in repo.list_posts_pending_extract(
+                conn, limit=50) if pid not in seen]
             if not batch:
                 break
             for post_id, body in batch:
+                seen.add(post_id)
                 counters["processed"] += 1
                 try:
                     completion = client.complete(render_extract_prompt(body))
