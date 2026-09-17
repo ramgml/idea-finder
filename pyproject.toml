@@ -5,7 +5,10 @@ description = "Pain harvesting, clustering, and scoring pipeline for the Russian
 readme = "AGENTS.md"
 requires-python = ">=3.12"
 # Runtime dependencies arrive with tasks B/C/D; the skeleton needs none.
-dependencies = []
+dependencies = [
+    "pgserver>=0.1.4",
+    "psycopg[binary]>=3.1",
+]
 
 [dependency-groups]
 dev = [
