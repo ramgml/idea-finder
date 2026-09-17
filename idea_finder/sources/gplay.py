@@ -27,9 +27,17 @@ database side.
 Configuration errors raise :class:`GPlayConfigError` (a subclass of
 :class:`FetchError` so generic fetch handling still catches it): a missing
 or unparsable config file, or a list without any app id, is a setup
-problem, not a network problem. Per-app scraper failures are isolated:
-they are logged as warnings and the remaining apps are still harvested —
-one dead app id must not sink the batch.
+problem, not a network problem — it still raises because no retry can
+fix it.
+
+Network failures degrade gracefully (task T334): a timed-out or otherwise
+unreachable Google Play request never raises out of
+:meth:`GPlayAdapter.fetch_new` — the app is skipped with a
+``logging.warning`` and an empty harvest for it. Every such network
+error also increments the public :attr:`GPlayAdapter.network_errors`
+counter (reset to 0 in the constructor): callers collect it into run
+statistics after ``fetch_new`` returns, since the
+:class:`SourceAdapter` protocol fixes the return value to the post list.
 """
 
 from __future__ import annotations
@@ -90,6 +98,11 @@ class GPlayAdapter:
 
     name: str = GPLAY_SOURCE_NAME
 
+    #: Network failures (timeouts, connection errors) met by the last
+    #: ``fetch_new`` run: one increment per failed app. Public so the
+    #: pipeline can fold it into run statistics; reset per adapter.
+    network_errors: int
+
     def __init__(
         self,
         *,
@@ -98,6 +111,7 @@ class GPlayAdapter:
     ) -> None:
         self._apps_path = Path(apps_path)
         self._count_per_app = count_per_app
+        self.network_errors = 0
 
     def _load_app_ids(self) -> list[str]:
         """Read the app-id list from the JSON config.
@@ -149,8 +163,11 @@ class GPlayAdapter:
         """Return 1-3 star reviews as complaint posts newer than ``since``.
 
         ``since`` is ``None`` on the first run: every harvested complaint
-        is returned. Each scraper call runs in a worker thread; a failing
-        app is logged and skipped, the rest of the batch survives.
+        is returned. Each scraper call runs in a worker thread. Network
+        failures degrade gracefully: a timed-out or unreachable app is
+        logged as a warning, skipped, and counted in
+        :attr:`network_errors`; the rest of the batch survives. Config
+        problems still raise :class:`GPlayConfigError`.
         """
         cutoff = self._since_utc(since)
         app_ids = self._load_app_ids()
@@ -158,10 +175,24 @@ class GPlayAdapter:
         for app_id in app_ids:
             try:
                 raw_reviews = await asyncio.to_thread(self._fetch_reviews, app_id)
-            except Exception:
-                # Any scraper error is app-local (bad id, network flap):
-                # one dead app must not sink the rest of the batch.
-                logger.exception("gplay: app %s failed, skipped", app_id)
+            except GPlayConfigError:
+                # Config errors are setup bugs, not network flaps: no retry
+                # can fix them, so they keep propagating to the caller.
+                raise
+            except Exception as e:
+                # Degrade gracefully (task T334): a timeout or any other
+                # network/scraper failure is logged as a warning, the app
+                # is skipped, and the network error counter is bumped so
+                # callers can fold it into run statistics. collect() must
+                # survive a fully unreachable network.
+                self.network_errors += 1
+                logger.warning(
+                    "gplay: app %s failed, skipped: %s: %s",
+                    app_id,
+                    type(e).__name__,
+                    e,
+                    exc_info=True,
+                )
                 continue
             kept = self._to_raw_posts(app_id, raw_reviews, cutoff)
             posts.extend(kept)
