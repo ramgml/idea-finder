@@ -245,6 +245,15 @@ wheels = [
 ]
 
 [[package]]
+name = "google-play-scraper"
+version = "1.2.7"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/db/29/3530af5fee212e7cdd31a5847ecb306c8202745f08dc608de10454a82499/google_play_scraper-1.2.7.tar.gz", hash = "sha256:284f321d1b2c39e39e97e490d51bc316e1d876802360efb7e7463b5c16ed4972", size = 41734, upload-time = "2024-06-07T01:03:11.325Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/33/f7/a23ef3cf8efc9ab3aee565971f59906811e6ce95475314ef7b18d02f30ba/google_play_scraper-1.2.7-py3-none-any.whl", hash = "sha256:a485510b09265f0096fc3813cfc26eef27e9a5c0035f99ee23f80e00de724530", size = 28988, upload-time = "2024-06-07T01:03:09.144Z" },
+]
+
+[[package]]
 name = "greenlet"
 version = "3.5.6"
 source = { registry = "https://pypi.org/simple" }
@@ -357,6 +366,7 @@ version = "0.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiolimiter" },
+    { name = "google-play-scraper" },
     { name = "httpx" },
     { name = "pgserver" },
     { name = "pgvector" },
@@ -378,6 +388,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiolimiter", specifier = ">=1.3.0" },
+    { name = "google-play-scraper", specifier = ">=1.2.7" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pgserver", specifier = ">=0.1.4" },
     { name = "pgvector", specifier = ">=0.3" },
