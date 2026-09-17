@@ -17,6 +17,8 @@ dependencies = [
     "trafilatura>=2.2.0",
     "selectolax>=0.4.11",
     "playwright>=1.45",
+    # Google Play RU reviews (idea_finder.sources.gplay).
+    "google-play-scraper>=1.2.7",
 ]
 
 [dependency-groups]
