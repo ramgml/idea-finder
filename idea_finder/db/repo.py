@@ -460,11 +460,11 @@ def list_posts_pending_extract(conn: Connection,
                                limit: int | None = None) -> list[tuple[str, str]]:
     """Return ``(post_id, body)`` for posts awaiting pain extraction.
 
-    A post is pending when it has no pain yet AND its fetch status is
-    ``'new'``/``'fetched'`` (COALESCE covers rows written before status
-    tracking). Posts with ``'failed'`` are bricked by contract: the extract
-    stage marks hopeless answers once and never retries them, so repeated
-    runs converge instead of burning tokens on the same garbage.
+    A post is pending when it has no pain yet AND its fetch status is not
+    terminal ('extracted' = processed with any outcome, 'failed' = hopeless
+    answer, never retried; COALESCE covers rows written before status
+    tracking). Both terminal states exist so repeated runs converge instead
+    of re-sending the same posts to the LLM forever.
     """
     sql = """
         SELECT p.id::text, p.body
@@ -482,15 +482,15 @@ def list_posts_pending_extract(conn: Connection,
 
 def set_raw_post_fetch_status(conn: Connection, post_id: str,
                               status: str) -> None:
-    """Set a post's ``fetch_status`` ('fetched' or 'failed').
+    """Set a post's ``fetch_status`` to a terminal value.
 
-    The extract stage pins each attempted post: 'fetched' when an answer was
-    processed (even with zero accepted pains), 'failed' when the answer is
-    hopeless (unparseable JSON) and must not be retried. Raises
+    The extract stage pins each attempted post: 'extracted' when the answer
+    was processed (even with zero accepted pains), 'failed' when the answer
+    is hopeless (unparseable JSON) and must not be retried. Raises
     :class:`RepoError` on an unknown post id or an invalid status value.
     """
-    if status not in {"fetched", "failed"}:
-        msg = f"invalid fetch_status: {status!r} (expected 'fetched' or 'failed')"
+    if status not in {"extracted", "failed"}:
+        msg = f"invalid fetch_status: {status!r} (expected 'extracted' or 'failed')"
         raise RepoError(msg)
     with conn.transaction():
         cursor = conn.execute(

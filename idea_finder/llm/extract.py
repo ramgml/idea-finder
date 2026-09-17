@@ -21,6 +21,7 @@ from typing import cast
 from jinja2 import Environment, StrictUndefined
 
 from idea_finder.core.models import Pain
+from idea_finder.llm.client import Completion
 
 __all__ = [
     "PAIN_FIELDS",
@@ -294,12 +295,15 @@ class FakeExtractLlmClient:
         self.model = model
         self.provider_name = provider_name
         self._pains = _load_fixture_pains()
-
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str) -> Completion:
         """Return the deterministic extract JSON answer for ``prompt``."""
         post_text = _post_text_from_prompt(prompt, self._pains)
         matched = [pain for quote, pain in self._pains if quote in post_text]
-        return json.dumps({"pains": matched[:_DEFAULT_MAX_PAINS]}, ensure_ascii=False)
+        text = json.dumps({"pains": matched[:_DEFAULT_MAX_PAINS]}, ensure_ascii=False)
+        return Completion(
+            text=text, prompt_tokens=0, completion_tokens=0,
+            model=self.model, provider_name=self.provider_name,
+        )
 
 
 def _load_fixture_pains() -> list[tuple[str, dict[str, object]]]:
