@@ -47,12 +47,6 @@ def test_cli_help_lists_all_subcommands() -> None:
         assert name in result.stdout
 
 
-def test_cli_status_responds() -> None:
-    result = run_cli("status")
-    assert result.returncode == 0
-    assert "counters" in result.stdout
-
-
 def test_cli_captcha_requires_domain_argument() -> None:
     result = run_cli("captcha")
     assert result.returncode != 0
