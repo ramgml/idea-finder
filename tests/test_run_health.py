@@ -262,6 +262,27 @@ def test_stage_progress_renders_all_stages(conn: Connection) -> None:
     assert by_name["Скоринг"].metrics == "—"
 
 
+def test_stage_progress_collect_metrics_t341(conn: Connection) -> None:
+    """T341 P2-2: the Сбор line renders run_collect's real counters.
+
+    run_collect writes ``collected``/``skipped``/``warnings`` since T335;
+    the view used to wait for the pre-T335 "rows" key and silently
+    rendered zero metrics.
+    """
+    _run(
+        conn,
+        {"collect": "done"},
+        stats={"collected": 12, "skipped": 3, "warnings": 1},
+        started_at=datetime(2027, 1, 1, tzinfo=UTC),
+    )
+    run = list_runs(conn)[0]
+    by_name = {p.name: p for p in stage_progress(run)}
+    metrics = by_name["Сбор"].metrics
+    assert "собрано 12" in metrics
+    assert "дубликаты URL 3" in metrics
+    assert "источники с ошибками 1" in metrics
+
+
 def test_run_command_argv() -> None:
     """The subprocess launches the same CLI run an operator would use."""
     argv = run_command()

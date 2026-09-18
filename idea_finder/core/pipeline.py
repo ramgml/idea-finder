@@ -300,6 +300,7 @@ def run_collect(conn: Connection) -> StageStats:
     enabled = repo.list_enabled_sources(conn)
     run_id = repo.create_run(conn, {"collect": "running"})
     counters = {"collected": 0, "skipped": 0, "warnings": 0}
+    status = "done"
     try:
         for name, rate in enabled:
             adapter_factory = _ADAPTERS.get(name)
@@ -329,16 +330,20 @@ def run_collect(conn: Connection) -> StageStats:
                     counters["skipped"] += 1
                 else:
                     counters["collected"] += 1
-        repo.update_run_stage(conn, run_id, "collect", "done", stats_delta=dict(counters))
+        repo.update_run_stage(conn, run_id, "collect", status, stats_delta=dict(counters))
     except Exception:
-        repo.update_run_stage(conn, run_id, "collect", "error", stats_delta=dict(counters))
+        status = "error"
+        repo.update_run_stage(conn, run_id, "collect", status, stats_delta=dict(counters))
         raise
     finally:
         # The deltas were written once above; this update only flips the
         # stage status (_stats_merge accumulates) and closes the run even
-        # on a crash mid-loop — a run row never hangs "running".
+        # on a crash mid-loop — a run row never hangs "running". The
+        # status variable preserves "error" from the except branch: the
+        # unconditional finally must never overwrite it with "done"
+        # (same discipline as run_cluster/run_score).
         repo.update_run_stage(
-            conn, run_id, "collect", "done", stats_delta=dict.fromkeys(counters, 0)
+            conn, run_id, "collect", status, stats_delta=dict.fromkeys(counters, 0)
         )
         repo.finish_run(conn, run_id)
     return dict(counters)

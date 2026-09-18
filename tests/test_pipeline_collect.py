@@ -150,6 +150,29 @@ def test_collect_run_row_records_done_and_stats(conn: Connection, patch_registry
     assert json.dumps(stored)  # stats survive a JSON round trip
 
 
+def test_collect_crash_outside_isolation_stays_error(
+    conn: Connection, patch_registry: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T341 P2-1: the finally block never overwrites "error" with "done".
+
+    The crash here skips per-source isolation entirely (the seam where
+    run_collect's except marks "error"): insert_raw_post blows up after
+    a successful fetch. The old unconditional finally re-wrote "done"
+    over it, showing the operator a green run for a crashed one.
+    """
+    conn.execute("UPDATE source SET enabled = false WHERE name != 'fl_ru'")
+    monkeypatch.setattr(
+        "idea_finder.core.pipeline.repo.insert_raw_post",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db exploded")),
+    )
+    with pytest.raises(RuntimeError, match="db exploded"):
+        run_collect(conn)
+    runs = conn.execute("SELECT stages_json FROM run").fetchall()
+    assert len(runs) == 1
+    stages = runs[0][0] if isinstance(runs[0][0], dict) else json.loads(str(runs[0][0]))
+    assert stages["collect"] == "error"
+
+
 # --- per-source isolation ---------------------------------------------------
 
 
