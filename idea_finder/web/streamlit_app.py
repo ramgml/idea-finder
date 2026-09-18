@@ -23,8 +23,10 @@ from psycopg import Connection
 
 from idea_finder.db.bootstrap_pgserver import DbError, ensure_pgserver
 from idea_finder.db.migrate import apply_migrations
+from idea_finder.web.cluster_feedback_view import set_feedback, set_split_flag
 from idea_finder.web.clusters_view import (
     MAX_SCORE,
+    ClusterDetail,
     ClusterFilters,
     ClusterRow,
     get_cluster_detail,
@@ -132,16 +134,22 @@ def _render_clusters_page() -> None:
     if conn is None:
         st.error(_DB_DOWN_TEXT)
         return
-    rows = list_clusters(conn)
+    include_hidden = st.toggle("Показывать скрытые", value=False)
+    rows = list_clusters(conn, include_hidden=include_hidden)
     if not rows:
         st.info(_EMPTY_STATE_TEXT)
         return
     filters = _render_filters(conn)
-    visible = list_clusters_filtered(conn, filters) if filters != ClusterFilters() else rows
+    visible = (
+        list_clusters_filtered(conn, filters, include_hidden=include_hidden)
+        if filters != ClusterFilters()
+        else rows
+    )
     _render_clusters_table(visible)
     st.caption(
         "Сортировка по скору (лучшие сверху); кластеры без оценки — в конце. "
-        "«обновлено» — по created_at кластера."
+        "«обновлено» — по created_at кластера. Скрытые (feedback «скрыть») "
+        "не показываются без переключателя «Показывать скрытые»."
     )
     if visible:
         _render_cluster_card(conn, visible)
@@ -181,6 +189,52 @@ def _render_clusters_table(rows: list[ClusterRow]) -> None:
     )
 
 
+def _render_feedback_row(conn: Connection, detail: ClusterDetail) -> None:
+    """Feedback row (T315): «Интересно», «Скрыть», «Это не одна боль».
+
+    Each button writes its label immediately and reruns; the current state
+    renders as a caption line. Writes go through the web-layer helpers
+    (:mod:`idea_finder.web.cluster_feedback_view`) — repo.py stays shared.
+    """
+    cols = st.columns([1, 1, 2])
+    set_interesting = cols[0].button("Интересно")
+    set_hidden = cols[1].button("Скрыть")
+    set_split = cols[2].button("Это не одна боль", type="secondary")
+    current = conn.execute(
+        "SELECT feedback, split_flag FROM cluster WHERE id = %s",
+        (detail.id,),
+    ).fetchone()
+    if current is None:
+        st.warning("Кластер не найден.")
+        return
+    current_feedback, current_split = current
+    changed = False
+    if set_interesting:
+        set_feedback(conn, detail.id, "interesting")
+        conn.commit()
+        changed = True
+    if set_hidden:
+        set_feedback(conn, detail.id, "hidden")
+        conn.commit()
+        changed = True
+    if set_split:
+        set_split_flag(conn, detail.id, not bool(current_split))
+        conn.commit()
+        changed = True
+    if changed:
+        st.rerun()
+    feedback, split_flag = current_feedback, current_split
+    marks: list[str] = []
+    if feedback == "interesting":
+        marks.append("метка: **интересно**")
+    elif feedback == "hidden":
+        marks.append("метка: **скрыт** (виден только с «Показывать скрытые»)")
+    if split_flag:
+        marks.append("помечен: **это не одна боль**")
+    if marks:
+        st.caption(" · ".join(marks))
+
+
 def _render_cluster_card(conn: Connection, rows: list[ClusterRow]) -> None:
     """Master-detail card: pick a cluster, see rationale, quotes, pains."""
     labels = {
@@ -199,6 +253,7 @@ def _render_cluster_card(conn: Connection, rows: list[ClusterRow]) -> None:
     header_cols[1].metric("Размер", str(detail.size))
     header_cols[2].metric("Типы", _format_kinds(detail.kinds))
     header_cols[3].metric("Источники", str(len(detail.sources)))
+    _render_feedback_row(conn, detail)
     if detail.rationale_md:
         st.subheader("Обоснование")
         st.markdown(detail.rationale_md)

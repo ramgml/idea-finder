@@ -190,11 +190,11 @@ def test_migrations_include_run_prompt_version(pg: PgHandle) -> None:
     """Migrations up to 005 are applied on the module cluster (e)."""
     with pg.get_conn() as conn:
         applied = apply_migrations(conn)  # [] when earlier tests migrated already
-        assert applied == [] or applied == [1, 2, 3, 4, 5]
+        assert applied == [] or applied == [1, 2, 3, 4, 5, 6]
         versions = conn.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [int(v[0]) for v in versions] == [1, 2, 3, 4, 5]
+        assert [int(v[0]) for v in versions] == [1, 2, 3, 4, 5, 6]
         row = conn.execute(
             """
             SELECT column_name FROM information_schema.columns
