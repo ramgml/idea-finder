@@ -45,6 +45,7 @@ from idea_finder.llm.score import (
     SCORE_PROMPT_NAME,
     SCORE_PROMPT_VERSION,
     ClusterSummary,
+    FakeScoreLlmClient,
     InvalidScoreResponseError,
     llm_score_to_storage,
     load_score_template,
@@ -327,7 +328,16 @@ def run_score(conn: Connection) -> StageStats:
         load_score_template(), "file",
     )
     run_id = repo.create_run(conn, {"score": "running"})
-    client = build_llm_client(conn)
+    provider = repo.get_active_llm_provider(conn)
+    if provider is not None and provider.kind == "fake":
+        # Owner UPDATE 2026-09-17: scoring runs on the fake provider —
+        # its fixture-derived raw-pain answers are extract-shaped, not
+        # score JSON, so the stage swaps in the score-format fake.
+        client = FakeScoreLlmClient(
+            model=provider.model or "fake", provider_name=provider.name
+        )
+    else:
+        client = build_llm_client(conn)
 
     counters = {"clusters": len(clusters), "scored": 0, "rejected": 0,
                 "sanity_flag": 0}
