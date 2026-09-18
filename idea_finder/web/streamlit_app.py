@@ -33,6 +33,7 @@ from idea_finder.web.clusters_view import (
     list_source_names,
 )
 from idea_finder.web.health_view import SourceHealthRow, health_report
+from idea_finder.web.prompts_view import render_prompts_page
 from idea_finder.web.run_view import RunRow, has_active_run, list_runs, run_command, stage_progress
 
 logger = logging.getLogger(__name__)
@@ -361,6 +362,8 @@ def main() -> None:
         _render_run_page()
     elif page == "Здоровье":
         _render_health_page()
+    elif page == "Промпты":
+        render_prompts_page()
     else:
         _render_placeholder_page(page)
 
