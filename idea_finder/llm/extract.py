@@ -21,6 +21,7 @@ from typing import cast
 from jinja2 import Environment, StrictUndefined
 
 from idea_finder.core.models import Pain
+from idea_finder.llm.client import Completion
 
 __all__ = [
     "PAIN_FIELDS",
@@ -30,9 +31,11 @@ __all__ = [
     "InvalidResponseError",
     "PromptTemplateError",
     "extract_stats_to_dict",
+    "load_extract_template",
     "parse_extract_response",
     "render_extract_prompt",
 ]
+
 
 #: Name the extract prompt is registered under (prompt_version table).
 PROMPT_NAME = "extract_pains"
@@ -124,6 +127,16 @@ def _load_template() -> str:
     except (FileNotFoundError, ModuleNotFoundError) as e:
         msg = "extract prompt template idea_finder/llm/prompts/extract_pains.md is missing"
         raise PromptTemplateError(msg) from e
+
+
+def load_extract_template() -> str:
+    """Return the raw extract prompt template (the versioned artifact).
+
+    The extract stage registers this exact text under ``(PROMPT_NAME,
+    PROMPT_VERSION)`` in the ``prompt_version`` table once per run, so a
+    run stays reproducible against the shipped prompt source.
+    """
+    return _load_template()
 
 
 def render_extract_prompt(post_text: str, max_pains: int = _DEFAULT_MAX_PAINS) -> str:
@@ -282,12 +295,15 @@ class FakeExtractLlmClient:
         self.model = model
         self.provider_name = provider_name
         self._pains = _load_fixture_pains()
-
-    def complete(self, prompt: str) -> str:
+    def complete(self, prompt: str) -> Completion:
         """Return the deterministic extract JSON answer for ``prompt``."""
         post_text = _post_text_from_prompt(prompt, self._pains)
         matched = [pain for quote, pain in self._pains if quote in post_text]
-        return json.dumps({"pains": matched[:_DEFAULT_MAX_PAINS]}, ensure_ascii=False)
+        text = json.dumps({"pains": matched[:_DEFAULT_MAX_PAINS]}, ensure_ascii=False)
+        return Completion(
+            text=text, prompt_tokens=0, completion_tokens=0,
+            model=self.model, provider_name=self.provider_name,
+        )
 
 
 def _load_fixture_pains() -> list[tuple[str, dict[str, object]]]:

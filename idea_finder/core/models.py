@@ -97,9 +97,12 @@ class Run:
 
     ``stages`` maps stage name to status (e.g. ``{"collect": "done"}``);
     ``stats`` carries per-run counters such as bricked records.
+    ``prompt_version_id`` pins the prompt_version the extract stage used,
+    making the run reproducible (NULL for legacy runs).
     """
 
     stages: dict[str, str]
     stats: dict[str, int]
     cost: float
     id: str | None = None
+    prompt_version_id: str | None = None
