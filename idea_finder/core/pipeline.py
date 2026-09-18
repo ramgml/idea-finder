@@ -46,6 +46,7 @@ from idea_finder.llm.score import (
     SCORE_PROMPT_VERSION,
     ClusterSummary,
     InvalidScoreResponseError,
+    llm_score_to_storage,
     load_score_template,
     parse_score_response,
     render_score_prompt,
@@ -357,7 +358,9 @@ def run_score(conn: Connection) -> StageStats:
                 conn,
                 Score(
                     cluster_id=cluster.id,
-                    total=answer.total,
+                    # LLM rubric is 0-100 (SCORING.md); storage column is
+                    # 0-10 (migration 001) — convert at write time.
+                    total=llm_score_to_storage(answer.total),
                     rationale_md=answer.rationale_md,
                     quotes=answer.quotes,
                 ),

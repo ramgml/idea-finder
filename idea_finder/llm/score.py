@@ -185,6 +185,18 @@ def parse_score_response(answer: str, pain_bodies: list[str]) -> ScoreAnswer:
     )
 
 
+def llm_score_to_storage(llm_score: float) -> float:
+    """Convert the rubric scale (0-100, context/SCORING.md) to storage (0-10).
+
+    Two scales exist by design: the LLM rubric answers 0-100 per
+    SCORING.md, while the DB column ``score.total`` is CHECK-bound to
+    0-10 (migrations/001_init.sql) and the dashboard renders 0-10
+    (T311). The stage divides by 10 at write time; the sanity gate
+    operates on the LLM scale before conversion.
+    """
+    return round(llm_score / 10, 2)
+
+
 class FakeScoreLlmClient:
     """Deterministic JSON-answer client for score-stage acceptance runs.
 
