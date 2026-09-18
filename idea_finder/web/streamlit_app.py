@@ -30,6 +30,7 @@ from idea_finder.web.clusters_view import (
     list_clusters_filtered,
     list_source_names,
 )
+from idea_finder.web.prompts_view import render_prompts_page
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,8 @@ def main() -> None:
     page = st.sidebar.radio("Навигация", _PAGE_TITLES)
     if page == "Кластеры":
         _render_clusters_page()
+    elif page == "Промпты":
+        render_prompts_page()
     else:
         _render_placeholder_page(page)
 
