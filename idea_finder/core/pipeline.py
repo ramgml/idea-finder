@@ -66,10 +66,11 @@ from idea_finder.sources.habr import HabrAdapter
 
 LOGGER = logging.getLogger(__name__)
 
-#: Cosine similarity above which a pain joins an existing cluster (the
-#: value comes from context/SYSTEM_DESIGN.md; moved to config once the
-#: project grows a configuration surface).
-CLUSTER_THRESHOLD: Final = 0.82
+#: Cosine similarity above which a pain joins an existing cluster
+#: (0.88, G1-calibrated; known centroid-drift limitation on small
+#: corpora — see D3. Moved to config once the project grows a
+#: configuration surface).
+CLUSTER_THRESHOLD: Final = 0.88
 
 type StageStats = dict[str, int]
 

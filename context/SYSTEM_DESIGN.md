@@ -59,7 +59,7 @@ idea_finder/
 ```
 Источники → RawPost{source_id, url_canon, title, text, published_at, kind}
   → LLM-извлечение боли (FakeLlmClient в мок-режиме) → Pain{body, audience, quote}
-  → эмбеддинг pain.body (e5-small, CPU) → кластеризация (косинус, порог ~0.82)
+  -> эмбеддинг pain.body (e5-small, CPU) -> кластеризация (косинус, порог 0.88, G1-калибровка; известное ограничение centroid-drift на малых корпусах — см. D3)
   → Cluster{size, kind_mix} → скоринг по рубрике (context/SCORING.md) → Score{total, rationale, quotes}
 ```
 
