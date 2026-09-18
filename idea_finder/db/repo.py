@@ -364,17 +364,18 @@ def reset_cluster_assignment(conn: Connection) -> int:
     """Drop the previous clustering pass; return how many pains were reset.
 
     Clusters are stage outputs recomputed per run: the stage clears all
-    assignments and deletes every cluster row before regrouping, so a
-    repeated run produces the same partition with no orphan rows. The
-    score stage does not exist yet (skeleton), so no score rows can
-    reference deleted clusters; when score lands it must reset clusters
-    through the pipeline order instead of this function.
+    assignments, deletes every score row (cluster ids do not survive a
+    recompute, so their scores are stale by definition — the next
+    ``run_score`` re-scores the fresh partition) and every cluster row
+    before regrouping, so a repeated run produces the same partition with
+    no orphan rows.
     """
     with conn.transaction():
         count_row = conn.execute(
             "SELECT count(*) FROM pain WHERE cluster_id IS NOT NULL"
         ).fetchone()
         conn.execute("UPDATE pain SET cluster_id = NULL")
+        conn.execute("DELETE FROM score")
         conn.execute("DELETE FROM cluster")
     reset = int(count_row[0]) if count_row is not None else 0
     return reset
