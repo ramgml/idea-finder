@@ -28,7 +28,7 @@ from typing import Final
 from psycopg import Connection
 
 from idea_finder.core.embed import embed_pains
-from idea_finder.core.models import Pain
+from idea_finder.core.models import Pain, Score
 from idea_finder.db import repo
 from idea_finder.llm.client import LlmError, build_llm_client, estimate_cost
 from idea_finder.llm.extract import (
@@ -41,6 +41,17 @@ from idea_finder.llm.extract import (
     load_extract_template,
     parse_extract_response,
     render_extract_prompt,
+)
+from idea_finder.llm.score import (
+    SCORE_PROMPT_NAME,
+    SCORE_PROMPT_VERSION,
+    ClusterSummary,
+    FakeScoreLlmClient,
+    InvalidScoreResponseError,
+    llm_score_to_storage,
+    load_score_template,
+    parse_score_response,
+    render_score_prompt,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -297,8 +308,105 @@ def _cluster_title(pain: repo.ClusterInputPain) -> str:
 
 
 def run_score(conn: Connection) -> StageStats:
-    """Score clusters against the Russian-market rubric.
+    """Score unscored clusters against the Russian-market rubric (T310, E1).
 
-    Implemented in task E-flow (market rubric).
+    Each cluster without a score gets the v1 rubric prompt
+    (:func:`~idea_finder.llm.score.render_score_prompt`, 7 weighted
+    criteria, demand-boost on monetization) answered by the active LLM
+    provider; the validated answer lands in ``score`` via
+    :func:`repo.insert_score` (one row per cluster, replaced on re-score).
+
+    Idempotent by selection: clusters already carrying a score are skipped,
+    so a rerun over unchanged state processes nothing. Validation rejects
+    (never raises) bad model output: unparseable JSON, out-of-range score,
+    empty rationale, hallucinated quotes — the rejected counter tracks them
+    and the cluster stays unscored for a later run.
+
+    The distribution sanity gate (context/SCORING.md rule 3) sets
+    ``sanity_flag`` to 1 when at least 3 clusters were scored into a
+    suspiciously narrow band (spread < 10 points) — a degenerate rubric
+    the system-health page should surface.
+
+    Returns:
+        ``{"clusters": N, "scored": S, "rejected": R, "sanity_flag": F}``
+        run's stats; empty clusters -> zero stats and no
+        run row (mirrors the other stages' no-op).
     """
-    return _skeleton_stage(conn, "score")
+    clusters = repo.list_clusters_without_score(conn)
+    if not clusters:
+        LOGGER.info("run_score: no unscored clusters, nothing to do")
+        return {"clusters": 0, "scored": 0, "rejected": 0, "sanity_flag": 0}
+
+    repo.upsert_prompt_version(
+        conn, SCORE_PROMPT_NAME, SCORE_PROMPT_VERSION,
+        load_score_template(), "file",
+    )
+    run_id = repo.create_run(conn, {"score": "running"})
+    provider = repo.get_active_llm_provider(conn)
+    if provider is not None and provider.kind == "fake":
+        # Owner UPDATE 2026-09-17: scoring runs on the fake provider —
+        # its fixture-derived raw-pain answers are extract-shaped, not
+        # score JSON, so the stage swaps in the score-format fake.
+        client = FakeScoreLlmClient(
+            model=provider.model or "fake", provider_name=provider.name
+        )
+    else:
+        client = build_llm_client(conn)
+
+    counters = {"clusters": len(clusters), "scored": 0, "rejected": 0,
+                "sanity_flag": 0}
+    totals: list[float] = []
+    try:
+        for cluster in clusters:
+            prompt = render_score_prompt(
+                ClusterSummary(
+                    size=cluster.size,
+                    kinds=cluster.kind_mix,
+                    sources=cluster.sources,
+                    first_seen=cluster.first_seen,
+                    last_seen=cluster.last_seen,
+                    bodies=cluster.bodies,
+                )
+            )
+            try:
+                answer = parse_score_response(
+                    client.complete(prompt).text, cluster.bodies
+                )
+            except InvalidScoreResponseError:
+                # Rejected output: the cluster stays unscored, the run
+                # moves to the next one (SCORING.md rule 2: no rationale /
+                # no quotes -> no score).
+                counters["rejected"] += 1
+                continue
+            repo.insert_score(
+                conn,
+                Score(
+                    cluster_id=cluster.id,
+                    # LLM rubric is 0-100 (SCORING.md); storage column is
+                    # 0-10 (migration 001) — convert at write time.
+                    total=llm_score_to_storage(answer.total),
+                    rationale_md=answer.rationale_md,
+                    quotes=answer.quotes,
+                ),
+            )
+            totals.append(answer.total)
+            counters["scored"] += 1
+        if len(totals) >= 3 and max(totals) - min(totals) < 10:
+            # Degenerate rubric: everything scored into one narrow band
+            # (SCORING.md rule 3) — surface it in run.stats.
+            counters["sanity_flag"] = 1
+            LOGGER.warning(
+                "run_score: score distribution is suspiciously narrow "
+                "(%d scores within %.1f points)", len(totals),
+                max(totals) - min(totals),
+            )
+        repo.update_run_stage(conn, run_id, "score", "running",
+                              stats_delta=dict(counters))
+    finally:
+        status = "done" if counters["scored"] + counters["rejected"] == len(clusters) else "error"
+        # Deltas were written once above; the final update only flips the
+        # stage status (_stats_merge accumulates).
+        repo.update_run_stage(conn, run_id, "score", status,
+                              stats_delta=dict.fromkeys(counters, 0))
+        repo.finish_run(conn, run_id)
+    return dict(counters)
