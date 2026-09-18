@@ -58,6 +58,12 @@ def test_stage_command_prints_skeleton_stats(pgdata_dir: Path, stage: str) -> No
         # Real stage (T310): empty database -> zero counters, no run row,
         # no LLM provider needed.
         assert "score: {'clusters': 0, 'scored': 0," in result.stdout
+    elif stage == "collect":
+        # Real stage (T335): empty database, no enabled sources -> zero
+        # counters, no network. DoD: exit 0 with collected=0.
+        assert "collect: {'collected': 0, 'skipped': 0, 'warnings': 0}" in (
+            result.stdout
+        )
     else:
         assert f"{stage}: {{'rows': 0}}" in result.stdout
 
@@ -67,9 +73,9 @@ def test_run_executes_all_stages_in_order(pgdata_dir: Path) -> None:
     result = run_cli("run")
     assert result.returncode == 0, result.stderr
     last4 = result.stdout.splitlines()[-4:]
-    # extract, cluster and score are real now (own stats dicts); collect
-    # is still a skeleton stage from the B-flow.
-    assert last4[0] == "collect: {'rows': 0}"
+    # collect (T335), extract, cluster and score are real stages now,
+    # each printing its own stats dict on an empty database.
+    assert last4[0] == "collect: {'collected': 0, 'skipped': 0, 'warnings': 0}"
     assert last4[1].startswith("extract: {'processed': 0,")
     assert last4[2].startswith("cluster: {'pains': 0,")
     assert last4[3].startswith("score: {'clusters': 0, 'scored': 0,")
