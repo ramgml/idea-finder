@@ -37,6 +37,7 @@ from idea_finder.db.repo import (
     insert_raw_post,
     list_posts_pending_extract,
     table_counts,
+    upsert_llm_provider,
 )
 from idea_finder.llm.client import (
     Completion,
@@ -229,3 +230,32 @@ def test_extract_llm_error_leaves_post_pending(
     _use_client(conn, FakeExtractLlmClient(), monkeypatch)
     retry = run_extract(conn)
     assert retry["processed"] == 1 and retry["extracted"] >= 1
+
+
+def test_fake_provider_runs_extract_without_monkeypatch(conn: Connection) -> None:
+    """Mock mode end-to-end through the REAL factory (g, T333 contract).
+
+    CONTEXT.md promises: mock mode = is_default on the fake provider, a
+    full pipeline run with no code and no key. The factory's fake answers
+    raw pain texts, so the stage itself must route kind=fake to the
+    format-aware :class:`FakeExtractLlmClient` — exactly what this test
+    pins: no ``build_llm_client`` monkeypatching anywhere.
+    """
+    upsert_llm_provider(conn, "mock", "fake", "", "mock-model", "", is_active=True)
+    fixture_text = json.loads(
+        resources.files("idea_finder")
+        .joinpath("fixtures/posts/fl_ru.json")
+        .read_text(encoding="utf-8")
+    )[0]["text"]
+    _add_post(conn, fixture_text)
+
+    stats = run_extract(conn)
+
+    assert stats["processed"] == 1
+    assert stats["extracted"] >= 1
+    assert stats["failed"] == 0 and stats["invalid_json"] == 0
+    # The post reached a terminal state; a rerun processes nothing.
+    counts = table_counts(conn)
+    rerun = run_extract(conn)
+    assert rerun["processed"] == 0
+    assert table_counts(conn)["pain"] == counts["pain"]

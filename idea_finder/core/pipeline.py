@@ -35,6 +35,7 @@ from idea_finder.llm.extract import (
     PROMPT_NAME,
     PROMPT_VERSION,
     ExtractStats,
+    FakeExtractLlmClient,
     InvalidResponseError,
     extract_stats_to_dict,
     load_extract_template,
@@ -75,8 +76,19 @@ def run_extract(conn: Connection) -> StageStats:
         conn, PROMPT_NAME, PROMPT_VERSION, template, "file"
     )
     run_id = repo.create_run(conn, {"extract": "running"})
-    client = build_llm_client(conn)
     provider = repo.get_active_llm_provider(conn)
+    if provider is not None and provider.kind == "fake":
+        # Mock mode (CONTEXT.md: is_default on fake = full pipeline run
+        # without code or a key): the factory's FakeLlmClient answers with
+        # raw pain texts, but the extract stage needs extract-JSON, so the
+        # stage swaps in the format-aware fake (same pattern as the score
+        # stage's FakeScoreLlmClient). Real providers come from the
+        # factory unchanged.
+        client = FakeExtractLlmClient(
+            model=provider.model or "fake", provider_name=provider.name
+        )
+    else:
+        client = build_llm_client(conn)
 
     stats: ExtractStats = ExtractStats()
     counters = {"processed": 0, "extracted": 0, "failed": 0, "llm_errors": 0}

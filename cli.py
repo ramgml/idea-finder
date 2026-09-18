@@ -8,6 +8,7 @@ session kept in the persistent per-domain profile (fetch/browser.py).
 """
 
 import argparse
+import json
 import logging
 import sys
 from collections.abc import Callable
@@ -139,7 +140,59 @@ def _cmd_status(conn: Connection) -> int:
             cursor.execute(f"SELECT count(*) FROM {table}")
             count = cursor.fetchone()
         print(f"{table}: {count[0] if count is not None else 0}")
+    _print_latest_run(conn)
     return 0
+
+
+#: Brick counters surfaced by ``status`` when a run recorded them
+#: (extract-stage breakdown from :class:`idea_finder.llm.extract.ExtractStats`).
+_RUN_STATS_KEYS = (
+    "valid",
+    "hallucinated",
+    "schema_invalid",
+    "invalid_json",
+    "degraded_parse",
+    "extra_fields",
+    "cost_micro",
+)
+
+
+def _print_latest_run(conn: Connection) -> None:
+    """Print the latest run's stage states, brick counters, and prompt pin.
+
+    Read-only; nothing is printed when no run exists yet. The
+    ``prompt_version`` line names the pinned version (name@version) so an
+    operator can tell which prompt produced the stored pains.
+    """
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT id::text, stages_json, stats_json, prompt_version_id
+            FROM run
+            ORDER BY started_at DESC
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+    if row is None:
+        return
+    run_id, stages_raw, stats_raw, prompt_version_id = row
+    stages = stages_raw if isinstance(stages_raw, dict) else json.loads(str(stages_raw))
+    stats = stats_raw if isinstance(stats_raw, dict) else json.loads(str(stats_raw))
+    summary = ", ".join(f"{stage}={stages[stage]}" for stage in sorted(stages))
+    print(f"latest run {run_id}: {summary or 'no stages'}")
+    for key in _RUN_STATS_KEYS:
+        if key in stats:
+            print(f"  {key}: {stats[key]}")
+    if prompt_version_id is not None:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT name, version FROM prompt_version WHERE id = %s",
+                (prompt_version_id,),
+            )
+            version = cursor.fetchone()
+        if version is not None:
+            print(f"  prompt_version: {version[0]}@{version[1]}")
 
 
 def main(argv: list[str] | None = None) -> int:
