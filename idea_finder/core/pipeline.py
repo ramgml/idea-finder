@@ -24,15 +24,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import replace
 from typing import Final
 
 from psycopg import Connection
 
 from idea_finder.core.embed import embed_pains
-from idea_finder.core.models import Pain, Score
+from idea_finder.core.models import Pain, RawPost, Score
 from idea_finder.db import repo
+from idea_finder.fetch.httpx_fetcher import HttpFetcher
 from idea_finder.llm.client import LlmError, build_llm_client, estimate_cost
 from idea_finder.llm.extract import (
     PROMPT_NAME,
@@ -190,6 +193,60 @@ _ADAPTERS: Final[dict[str, Callable[[float], SourceAdapter]]] = {
 }
 
 
+#: Per-source wall-clock budget for one ``fetch_new`` call (seconds). The
+#: stage must stay responsive even when a scraper library ignores socket
+#: timeouts, so the coroutine is cancelled at the stage boundary.
+SOURCE_FETCH_TIMEOUT_S: Final[float] = 300.0
+
+#: Process-wide socket fallback for libs that call ``urlopen`` without a
+#: timeout (google-play-scraper): against a half-open TLS endpoint the
+#: worker thread would block forever and ``asyncio.run`` — which joins the
+#: default executor on exit — would hang the stage after cancellation.
+#: Scoped set/restore around each source; explicit timeouts win elsewhere.
+FETCH_SOCKET_TIMEOUT_S: Final[float] = 30.0
+
+
+def _open_fetcher(
+    adapter: SourceAdapter,
+) -> AbstractAsyncContextManager[HttpFetcher | None]:
+    """Return the adapter's fetcher as an async context manager.
+
+    Fetcher-backed adapters (fl_ru, habr) build their ``HttpFetcher`` in
+    ``__init__`` but open the HTTP client only inside ``__aenter__``;
+    ``fetch_new`` outside the context fails on the first request with
+    "used outside 'async with'". Adapters without a fetcher (gplay owns
+    its sync client) get a no-op wrapper.
+    """
+    fetcher = getattr(adapter, "_fetcher", None)
+    if isinstance(fetcher, HttpFetcher):
+        return fetcher
+    return nullcontext(None)
+
+
+async def _fetch_source(adapter: SourceAdapter) -> list[RawPost]:
+    """One ``fetch_new`` with the adapter's fetcher context opened."""
+    async with _open_fetcher(adapter):
+        return list(await adapter.fetch_new(None))
+
+
+async def _fetch_source_bounded(adapter: SourceAdapter) -> list[RawPost]:
+    """``_fetch_source`` under the stage's wall-clock budget.
+
+    ``asyncio.wait_for`` cancels the coroutine on expiry; a sync worker
+    thread a scraper parked work in cannot be killed, so
+    :data:`FETCH_SOCKET_TIMEOUT_S` bounds that thread's own sockets and
+    lets ``asyncio.run`` join the executor without hanging.
+    """
+    previous = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(FETCH_SOCKET_TIMEOUT_S)
+    try:
+        return await asyncio.wait_for(
+            _fetch_source(adapter), timeout=SOURCE_FETCH_TIMEOUT_S
+        )
+    finally:
+        socket.setdefaulttimeout(previous)
+
+
 def run_collect(conn: Connection) -> StageStats:
     """Fetch new posts from all enabled sources into ``raw_post`` (T335, B5).
 
@@ -202,9 +259,11 @@ def run_collect(conn: Connection) -> StageStats:
     nothing).
 
     One failing source never fails the stage (isolation pattern from the
-    gplay adapter): the error is counted in ``warnings``, the remaining
-    sources still deliver. A ``source`` row whose name has no registered
-    adapter counts as a warning too. Records only ever enter via ``repo``.
+    gplay adapter): each source runs under
+    :data:`SOURCE_FETCH_TIMEOUT_S` and the error is counted in
+    ``warnings``, the remaining sources still deliver. A ``source`` row
+    whose name has no registered adapter counts as a warning too.
+    Records only ever enter via ``repo``.
 
     Returns ``{"collected": N, "skipped": D, "warnings": W}`` — new rows,
     URL duplicates, and failed/unknown sources respectively.
@@ -223,7 +282,9 @@ def run_collect(conn: Connection) -> StageStats:
                 continue
             source_id = repo.ensure_source(conn, name)
             try:
-                posts = asyncio.run(adapter_factory(rate).fetch_new(None))
+                posts = asyncio.run(
+                    _fetch_source_bounded(adapter_factory(rate))
+                )
             except Exception as e:  # noqa: BLE001 - per-source isolation
                 LOGGER.warning(
                     "collect: source %s failed, skipped: %s: %s",
