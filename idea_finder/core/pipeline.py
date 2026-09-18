@@ -23,9 +23,11 @@ Usage (smoke)::
 from __future__ import annotations
 
 import logging
+from typing import Final
 
 from psycopg import Connection
 
+from idea_finder.core.embed import embed_pains
 from idea_finder.core.models import Pain
 from idea_finder.db import repo
 from idea_finder.llm.client import LlmError, build_llm_client, estimate_cost
@@ -41,6 +43,11 @@ from idea_finder.llm.extract import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+#: Cosine similarity above which a pain joins an existing cluster (the
+#: value comes from context/SYSTEM_DESIGN.md; moved to config once the
+#: project grows a configuration surface).
+CLUSTER_THRESHOLD: Final = 0.82
 
 type StageStats = dict[str, int]
 
@@ -156,11 +163,119 @@ def run_collect(conn: Connection) -> StageStats:
 
 
 def run_cluster(conn: Connection) -> StageStats:
-    """Embed pains and group them into clusters.
+    """Embed pains and group them into clusters (T309, D2).
 
-    Implemented in task D-flow (embeddings + grouping).
+    Greedy centroid clustering: pains arrive in deterministic order
+    (``created_at, id``); a pain joins the first cluster whose centroid is
+    within :data:`CLUSTER_THRESHOLD` cosine similarity, otherwise it opens
+    a new cluster. Centroids are the L2-renormalized mean of member
+    vectors, so the decision depends only on the partition, and a rerun
+    over unchanged input reproduces the exact same grouping.
+
+    Repeated runs are idempotent by full recompute: previous assignments
+    are cleared (via :func:`repo.reset_cluster_assignment`) and every
+    cluster row is rebuilt, so no orphans survive and ``count(*)`` of
+    clusters matches the partition. Embeddings are backfilled first via
+    :func:`idea_finder.core.embed.embed_pains` (no-op when current).
+
+    Returns:
+        ``{"pains": N, "clusters_new": X, "clusters_merged": Y,
+        "singletons": Z, "embedded": E}`` — all int, written to the run's
+        stats via the usual per-pass ``update_run_stage`` discipline.
     """
-    return _skeleton_stage(conn, "cluster")
+    embedded_counts = embed_pains(conn)
+    pains = repo.list_cluster_input_pains(conn)
+    if not pains:
+        # Nothing to group: no run row, empty stats (mirrors run_extract's
+        # empty-database no-op so a fresh cluster stays quiet).
+        LOGGER.info("run_cluster: no embedded pains, nothing to do")
+        return {"pains": 0, "clusters_new": 0, "clusters_merged": 0,
+                "singletons": 0, "embedded": int(embedded_counts.get("embedded", 0))}
+
+    repo.reset_cluster_assignment(conn)
+
+    run_id = repo.create_run(conn, {"cluster": "running"})
+    counters = {"pains": 0, "clusters_new": 0, "clusters_merged": 0,
+                "singletons": 0, "embedded": 0}
+    try:
+        # Partition state: cluster id -> running centroid (L2-normalized)
+        # and member pains. Recomputed greedily in deterministic order.
+        centroids: dict[str, list[float]] = {}
+        members: dict[str, list[repo.ClusterInputPain]] = {}
+        for pain in pains:
+            target = _nearest_cluster(centroids, pain.embedding, CLUSTER_THRESHOLD)
+            if target is None:
+                title = _cluster_title(pain)
+                cluster_id = repo.upsert_cluster(conn, title, size=1,
+                                                 kind_mix={pain.kind: 1})
+                centroids[cluster_id] = _normalized(pain.embedding)
+                members[cluster_id] = [pain]
+                counters["clusters_new"] += 1
+            else:
+                cluster_id = target
+                members[cluster_id].append(pain)
+                counters["clusters_merged"] += 1
+                centroid = _normalized(
+                    _mean_vector([m.embedding for m in members[cluster_id]])
+                )
+                centroids[cluster_id] = centroid
+            repo.assign_pain_cluster(conn, pain.id, cluster_id)
+            counters["pains"] += 1
+
+        for cluster_id, member_pains in members.items():
+            kind_mix: dict[str, int] = {}
+            for member in member_pains:
+                kind_mix[member.kind] = kind_mix.get(member.kind, 0) + 1
+            repo.update_cluster_stats(conn, cluster_id,
+                                      len(member_pains), kind_mix)
+        counters["singletons"] = sum(
+            1 for group in members.values() if len(group) == 1
+        )
+        counters["embedded"] = int(embedded_counts.get("embedded", 0))
+        repo.update_run_stage(conn, run_id, "cluster", "running",
+                              stats_delta=dict(counters))
+    finally:
+        status = "done" if counters["pains"] == len(pains) else "error"
+        repo.update_run_stage(conn, run_id, "cluster", status,
+                              stats_delta=dict(counters))
+        repo.finish_run(conn, run_id)
+    return dict(counters)
+
+
+def _nearest_cluster(centroids: dict[str, list[float]], vector: list[float],
+                     threshold: float) -> str | None:
+    """Return the first cluster id whose centroid is within ``threshold``.
+
+    Cosine similarity is plain dot product here: embeddings and centroids
+    are L2-normalized by construction.
+    """
+    best_id: str | None = None
+    best_similarity = threshold
+    for cluster_id, centroid in centroids.items():
+        similarity = sum(a * b for a, b in zip(vector, centroid, strict=True))
+        if similarity >= best_similarity:
+            best_similarity = similarity
+            best_id = cluster_id
+    return best_id
+
+
+def _mean_vector(vectors: list[list[float]]) -> list[float]:
+    """Component-wise mean of equal-length vectors."""
+    length = len(vectors[0])
+    return [sum(v[i] for v in vectors) / len(vectors) for i in range(length)]
+
+
+def _normalized(vector: list[float]) -> list[float]:
+    """Scale a vector to unit length (zero vector is returned as-is)."""
+    norm = sum(value * value for value in vector) ** 0.5
+    if norm == 0.0:
+        return vector
+    return [value / norm for value in vector]
+
+
+def _cluster_title(pain: repo.ClusterInputPain) -> str:
+    """Placeholder cluster title; the D-flow UI names clusters later."""
+    return f"cluster {pain.kind}"
 
 
 def run_score(conn: Connection) -> StageStats:
