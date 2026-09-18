@@ -31,8 +31,10 @@ from idea_finder.core.models import Pain, RawPost, Run, Score
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "ClusterInputPain",
     "LlmProviderRecord",
     "RepoError",
+    "assign_pain_cluster",
     "create_run",
     "ensure_source",
     "finish_run",
@@ -40,8 +42,10 @@ __all__ = [
     "insert_pain",
     "insert_raw_post",
     "insert_score",
+    "list_cluster_input_pains",
     "list_enabled_sources",
     "list_posts_pending_extract",
+    "reset_cluster_assignment",
     "set_raw_post_fetch_status",
     "table_counts",
     "update_cluster_stats",
@@ -246,6 +250,77 @@ def update_cluster_stats(conn: Connection, cluster_id: str, size: int,
         if cursor.rowcount == 0:
             msg = f"cluster not found: {cluster_id}"
             raise RepoError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterInputPain:
+    """One pain ready for clustering: id, embedding vector, post kind."""
+
+    id: str
+    embedding: list[float]
+    kind: str
+
+
+def list_cluster_input_pains(conn: Connection) -> list[ClusterInputPain]:
+    """Return every pain with an embedding, in deterministic order.
+
+    The cluster stage greedily groups these in order, so ``ORDER BY
+    created_at, id`` makes repeated runs over the same input converge on
+    the same partition. The pgvector text literal (``[1,2,3]``) is parsed
+    back into plain floats here so the stage works on simple lists.
+    """
+
+    def _parse_vector(raw: object) -> list[float]:
+        text = str(raw).strip().removeprefix("[").removesuffix("]")
+        return [float(part) for part in text.split(",") if part]
+
+    rows = conn.execute(
+        """
+        SELECT p.id::text, p.embedding, r.kind
+        FROM pain p
+        JOIN raw_post r ON r.id = p.raw_post_id
+        WHERE p.embedding IS NOT NULL
+        ORDER BY p.created_at, p.id
+        """
+    ).fetchall()
+    return [
+        ClusterInputPain(
+            id=str(pain_id), embedding=_parse_vector(vector), kind=str(kind)
+        )
+        for pain_id, vector, kind in rows
+    ]
+
+
+def assign_pain_cluster(conn: Connection, pain_id: str, cluster_id: str) -> None:
+    """Point one pain at its cluster (cluster stage reassignment)."""
+    with conn.transaction():
+        cursor = conn.execute(
+            "UPDATE pain SET cluster_id = %s WHERE id = %s",
+            (cluster_id, pain_id),
+        )
+        if cursor.rowcount == 0:
+            msg = f"assign_pain_cluster: unknown pain id {pain_id}"
+            raise RepoError(msg)
+
+
+def reset_cluster_assignment(conn: Connection) -> int:
+    """Drop the previous clustering pass; return how many pains were reset.
+
+    Clusters are stage outputs recomputed per run: the stage clears all
+    assignments and deletes every cluster row before regrouping, so a
+    repeated run produces the same partition with no orphan rows. The
+    score stage does not exist yet (skeleton), so no score rows can
+    reference deleted clusters; when score lands it must reset clusters
+    through the pipeline order instead of this function.
+    """
+    with conn.transaction():
+        count_row = conn.execute(
+            "SELECT count(*) FROM pain WHERE cluster_id IS NOT NULL"
+        ).fetchone()
+        conn.execute("UPDATE pain SET cluster_id = NULL")
+        conn.execute("DELETE FROM cluster")
+    reset = int(count_row[0]) if count_row is not None else 0
+    return reset
 
 
 def update_pain_embedding(conn: Connection, pain_id: str,
