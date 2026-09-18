@@ -18,7 +18,9 @@ e. a run row is written with ``stages_json.collect == 'done'``.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 
@@ -64,6 +66,17 @@ class _FailingAdapter:
         raise RuntimeError("network unreachable")
 
 
+class _HangingAdapter:
+    """In-test adapter whose feed fetch never returns (pure coroutine)."""
+
+    name = "hanging_source"
+
+    async def fetch_new(self, since: datetime | None) -> list[RawPost]:
+        del since
+        await asyncio.sleep(120)
+        return []
+
+
 @pytest.fixture(scope="module")
 def pg(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PgHandle]:
     """One embedded postgres cluster for the whole module."""
@@ -81,8 +94,7 @@ def conn(pg: PgHandle) -> Iterator[Connection]:
         seed_sources(connection)
         yield connection
         connection.execute(
-            "TRUNCATE source, prompt_version, run, llm_provider, pain,"
-            " raw_post, cluster CASCADE"
+            "TRUNCATE source, prompt_version, run, llm_provider, pain, raw_post, cluster CASCADE"
         )
 
 
@@ -103,9 +115,7 @@ def patch_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 # --- success path -----------------------------------------------------------
 
 
-def test_collect_inserts_posts_with_source_id_remap(
-    conn: Connection, patch_registry: None
-) -> None:
+def test_collect_inserts_posts_with_source_id_remap(conn: Connection, patch_registry: None) -> None:
     """Fake fl_ru feed lands in raw_post via repo, counters match DoD."""
     conn.execute("UPDATE source SET enabled = false WHERE name != 'fl_ru'")
     stats = run_collect(conn)
@@ -125,19 +135,13 @@ def test_collect_inserts_posts_with_source_id_remap(
     ]
 
 
-def test_collect_run_row_records_done_and_stats(
-    conn: Connection, patch_registry: None
-) -> None:
+def test_collect_run_row_records_done_and_stats(conn: Connection, patch_registry: None) -> None:
     """The stage owns its run row: stats_json and stage status are written."""
     conn.execute("UPDATE source SET enabled = false WHERE name != 'fl_ru'")
     run_collect(conn)
-    runs = conn.execute(
-        "SELECT stages_json, stats_json FROM run"
-    ).fetchall()
+    runs = conn.execute("SELECT stages_json, stats_json FROM run").fetchall()
     assert len(runs) == 1
-    stages = (
-        runs[0][0] if isinstance(runs[0][0], dict) else json.loads(str(runs[0][0]))
-    )
+    stages = runs[0][0] if isinstance(runs[0][0], dict) else json.loads(str(runs[0][0]))
     assert stages["collect"] == "done"
     stored = runs[0][1]
     if not isinstance(stored, dict):
@@ -149,10 +153,9 @@ def test_collect_run_row_records_done_and_stats(
 # --- per-source isolation ---------------------------------------------------
 
 
-def test_failing_source_does_not_block_healthy_one(
-    conn: Connection, patch_registry: None
-) -> None:
+def test_failing_source_does_not_block_healthy_one(conn: Connection, patch_registry: None) -> None:
     """gplay-degrade pattern at stage level: warning, rest still delivers."""
+    conn.execute("UPDATE source SET enabled = false WHERE name = 'gplay'")
     stats = run_collect(conn)
     assert stats == {"collected": 2, "skipped": 0, "warnings": 1}
     counts = table_counts(conn)
@@ -162,25 +165,49 @@ def test_failing_source_does_not_block_healthy_one(
 # --- idempotency ------------------------------------------------------------
 
 
-def test_second_run_collects_nothing_new(
-    conn: Connection, patch_registry: None
-) -> None:
+def test_second_run_collects_nothing_new(conn: Connection, patch_registry: None) -> None:
     """Rerun over unchanged feeds: collected=0, no duplicated rows."""
+    conn.execute("UPDATE source SET enabled = false WHERE name = 'gplay'")
     assert run_collect(conn)["collected"] == 2
     second = run_collect(conn)
-    assert second == {"collected": 0, "skipped": 0, "warnings": 1}
+    # The two feed items come back again but hit the url_canon UNIQUE
+    # contract: recorded as skipped, raw_post stays at 2 rows.
+    assert second == {"collected": 0, "skipped": 2, "warnings": 1}
     assert table_counts(conn)["raw_post"] == 2
+
+
+# --- stage-level bound -------------------------------------------------------
+
+
+def test_slow_source_cancelled_by_stage_budget(
+    conn: Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A source hanging past SOURCE_FETCH_TIMEOUT_S becomes one warning.
+
+    Proves the stage's own ``asyncio.wait_for`` (the isolation boundary
+    the stage owns), with a fake adapter — no network involved.
+    """
+    monkeypatch.setitem(_ADAPTERS, "fl_ru", lambda rate: _HangingAdapter())
+    conn.execute("UPDATE source SET enabled = false WHERE name != 'fl_ru'")
+    monkeypatch.setattr("idea_finder.core.pipeline.SOURCE_FETCH_TIMEOUT_S", 1.0)
+    t0 = time.monotonic()
+    stats = run_collect(conn)
+    elapsed = time.monotonic() - t0
+    assert stats == {"collected": 0, "skipped": 0, "warnings": 1}
+    # Far below the 300s default: the budget is the one under test.
+    assert elapsed < 30
 
 
 # --- registry mismatch ------------------------------------------------------
 
 
-def test_unknown_source_counts_as_warning(conn: Connection) -> None:
+def test_unknown_source_counts_as_warning(
+    conn: Connection, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """An enabled row without an adapter warns and does not crash."""
-    conn.execute(
-        "INSERT INTO source (name) VALUES ('no_adapter_for_me')"
-    )
-    conn.execute("UPDATE source SET enabled = false WHERE name != 'fl_ru'")
+    monkeypatch.delitem(_ADAPTERS, "fl_ru")
+    conn.execute("INSERT INTO source (name) VALUES ('no_adapter_for_me')")
+    conn.execute("UPDATE source SET enabled = false")
     conn.execute("UPDATE source SET enabled = true WHERE name = 'no_adapter_for_me'")
     stats = run_collect(conn)
     assert stats == {"collected": 0, "skipped": 0, "warnings": 1}
@@ -189,6 +216,7 @@ def test_unknown_source_counts_as_warning(conn: Connection) -> None:
 
 def test_disabled_sources_are_never_touched(conn: Connection) -> None:
     """The stage iterates only enabled rows (operator switch respected)."""
+    conn.execute("UPDATE source SET enabled = false")
     stats = run_collect(conn)
     assert stats == {"collected": 0, "skipped": 0, "warnings": 0}
     assert list_enabled_sources(conn) == []

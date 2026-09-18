@@ -90,8 +90,14 @@ def run_extract(conn: Connection) -> StageStats:
     if not repo.list_posts_pending_extract(conn, limit=1):
         # Nothing to do: no run row, no provider lookup, zero counters. A
         # fresh cluster without an active LLM provider stays a no-op here.
-        return {"processed": 0, "extracted": 0, "failed": 0, "llm_errors": 0,
-                **extract_stats_to_dict(ExtractStats()), "cost_micro": 0}
+        return {
+            "processed": 0,
+            "extracted": 0,
+            "failed": 0,
+            "llm_errors": 0,
+            **extract_stats_to_dict(ExtractStats()),
+            "cost_micro": 0,
+        }
     template = load_extract_template()
     prompt_version_id = repo.upsert_prompt_version(
         conn, PROMPT_NAME, PROMPT_VERSION, template, "file"
@@ -105,9 +111,7 @@ def run_extract(conn: Connection) -> StageStats:
         # stage swaps in the format-aware fake (same pattern as the score
         # stage's FakeScoreLlmClient). Real providers come from the
         # factory unchanged.
-        client = FakeExtractLlmClient(
-            model=provider.model or "fake", provider_name=provider.name
-        )
+        client = FakeExtractLlmClient(model=provider.model or "fake", provider_name=provider.name)
     else:
         client = build_llm_client(conn)
 
@@ -118,8 +122,11 @@ def run_extract(conn: Connection) -> StageStats:
     # but one run must not re-send the same post to the provider forever.
     try:
         while True:
-            batch = [(pid, b) for pid, b in repo.list_posts_pending_extract(
-                conn, limit=50) if pid not in seen]
+            batch = [
+                (pid, b)
+                for pid, b in repo.list_posts_pending_extract(conn, limit=50)
+                if pid not in seen
+            ]
             if not batch:
                 break
             for post_id, body in batch:
@@ -150,9 +157,15 @@ def run_extract(conn: Connection) -> StageStats:
                     provider.price_per_mtok if provider else None,
                 )
             repo.update_run_stage(
-                conn, run_id, "extract", "running",
-                stats_delta={**counters, **extract_stats_to_dict(stats),
-                             "cost_micro": _to_micro(cost_total)},
+                conn,
+                run_id,
+                "extract",
+                "running",
+                stats_delta={
+                    **counters,
+                    **extract_stats_to_dict(stats),
+                    "cost_micro": _to_micro(cost_total),
+                },
                 prompt_version_id=prompt_version_id,
             )
         # Deltas were written with each batch; the final update only flips
@@ -161,7 +174,10 @@ def run_extract(conn: Connection) -> StageStats:
     finally:
         status = "done" if counters["llm_errors"] == 0 else "error"
         repo.update_run_stage(
-            conn, run_id, "extract", status,
+            conn,
+            run_id,
+            "extract",
+            status,
             stats_delta=None,
             prompt_version_id=prompt_version_id,
         )
@@ -169,14 +185,12 @@ def run_extract(conn: Connection) -> StageStats:
     return {**counters, **extract_stats_to_dict(stats), "cost_micro": _to_micro(cost_total)}
 
 
-def _store_pains(conn: Connection, post_id: str, pains: list[Pain],
-                 prompt_version_id: str) -> None:
+def _store_pains(conn: Connection, post_id: str, pains: list[Pain], prompt_version_id: str) -> None:
     """Persist accepted pains bound to their source post."""
     for pain in pains:
         repo.insert_pain(
             conn,
-            Pain(source_post_id=post_id, body=pain.body,
-                 audience=pain.audience, quote=pain.quote),
+            Pain(source_post_id=post_id, body=pain.body, audience=pain.audience, quote=pain.quote),
             None,
             prompt_version_id,
         )
@@ -232,19 +246,34 @@ async def _fetch_source(adapter: SourceAdapter) -> list[RawPost]:
 async def _fetch_source_bounded(adapter: SourceAdapter) -> list[RawPost]:
     """``_fetch_source`` under the stage's wall-clock budget.
 
-    ``asyncio.wait_for`` cancels the coroutine on expiry; a sync worker
-    thread a scraper parked work in cannot be killed, so
-    :data:`FETCH_SOCKET_TIMEOUT_S` bounds that thread's own sockets and
-    lets ``asyncio.run`` join the executor without hanging.
+    ``asyncio.wait_for`` cancels the coroutine on expiry. The loop is
+    closed without ``shutdown_default_executor`` (the caller runs this on
+    its own loop via :func:`_run_bounded`), so a worker thread a scraper
+    parked work in cannot block the stage: its sockets are bounded by
+    :data:`FETCH_SOCKET_TIMEOUT_S` instead.
     """
     previous = socket.getdefaulttimeout()
     socket.setdefaulttimeout(FETCH_SOCKET_TIMEOUT_S)
     try:
-        return await asyncio.wait_for(
-            _fetch_source(adapter), timeout=SOURCE_FETCH_TIMEOUT_S
-        )
+        return await asyncio.wait_for(_fetch_source(adapter), timeout=SOURCE_FETCH_TIMEOUT_S)
     finally:
         socket.setdefaulttimeout(previous)
+
+
+def _run_bounded(adapter: SourceAdapter) -> list[RawPost]:
+    """Sync bridge: one bounded fetch on a fresh, explicitly-closed loop.
+
+    ``asyncio.run`` would join the loop's default executor at shutdown —
+    with a wedged worker thread that join has no timeout, so the stage
+    would hang past its own budget. A bare ``run_until_complete`` + close
+    returns control at the budget; leftover worker threads die with the
+    process (bounded by :data:`FETCH_SOCKET_TIMEOUT_S`).
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_fetch_source_bounded(adapter))
+    finally:
+        loop.close()
 
 
 def run_collect(conn: Connection) -> StageStats:
@@ -282,13 +311,13 @@ def run_collect(conn: Connection) -> StageStats:
                 continue
             source_id = repo.ensure_source(conn, name)
             try:
-                posts = asyncio.run(
-                    _fetch_source_bounded(adapter_factory(rate))
-                )
+                posts = _run_bounded(adapter_factory(rate))
             except Exception as e:  # noqa: BLE001 - per-source isolation
                 LOGGER.warning(
                     "collect: source %s failed, skipped: %s: %s",
-                    name, type(e).__name__, e,
+                    name,
+                    type(e).__name__,
+                    e,
                 )
                 counters["warnings"] += 1
                 continue
@@ -300,18 +329,17 @@ def run_collect(conn: Connection) -> StageStats:
                     counters["skipped"] += 1
                 else:
                     counters["collected"] += 1
-        repo.update_run_stage(conn, run_id, "collect", "done",
-                              stats_delta=dict(counters))
+        repo.update_run_stage(conn, run_id, "collect", "done", stats_delta=dict(counters))
     except Exception:
-        repo.update_run_stage(conn, run_id, "collect", "error",
-                              stats_delta=dict(counters))
+        repo.update_run_stage(conn, run_id, "collect", "error", stats_delta=dict(counters))
         raise
     finally:
         # The deltas were written once above; this update only flips the
         # stage status (_stats_merge accumulates) and closes the run even
         # on a crash mid-loop — a run row never hangs "running".
-        repo.update_run_stage(conn, run_id, "collect", "done",
-                              stats_delta=dict.fromkeys(counters, 0))
+        repo.update_run_stage(
+            conn, run_id, "collect", "done", stats_delta=dict.fromkeys(counters, 0)
+        )
         repo.finish_run(conn, run_id)
     return dict(counters)
 
@@ -343,14 +371,18 @@ def run_cluster(conn: Connection) -> StageStats:
         # Nothing to group: no run row, empty stats (mirrors run_extract's
         # empty-database no-op so a fresh cluster stays quiet).
         LOGGER.info("run_cluster: no embedded pains, nothing to do")
-        return {"pains": 0, "clusters_new": 0, "clusters_merged": 0,
-                "singletons": 0, "embedded": int(embedded_counts.get("embedded", 0))}
+        return {
+            "pains": 0,
+            "clusters_new": 0,
+            "clusters_merged": 0,
+            "singletons": 0,
+            "embedded": int(embedded_counts.get("embedded", 0)),
+        }
 
     repo.reset_cluster_assignment(conn)
 
     run_id = repo.create_run(conn, {"cluster": "running"})
-    counters = {"pains": 0, "clusters_new": 0, "clusters_merged": 0,
-                "singletons": 0, "embedded": 0}
+    counters = {"pains": 0, "clusters_new": 0, "clusters_merged": 0, "singletons": 0, "embedded": 0}
     try:
         # Partition state: cluster id -> running centroid (L2-normalized)
         # and member pains. Recomputed greedily in deterministic order.
@@ -360,8 +392,7 @@ def run_cluster(conn: Connection) -> StageStats:
             target = _nearest_cluster(centroids, pain.embedding, CLUSTER_THRESHOLD)
             if target is None:
                 title = _cluster_title(pain)
-                cluster_id = repo.upsert_cluster(conn, title, size=1,
-                                                 kind_mix={pain.kind: 1})
+                cluster_id = repo.upsert_cluster(conn, title, size=1, kind_mix={pain.kind: 1})
                 centroids[cluster_id] = _normalized(pain.embedding)
                 members[cluster_id] = [pain]
                 counters["clusters_new"] += 1
@@ -369,9 +400,7 @@ def run_cluster(conn: Connection) -> StageStats:
                 cluster_id = target
                 members[cluster_id].append(pain)
                 counters["clusters_merged"] += 1
-                centroid = _normalized(
-                    _mean_vector([m.embedding for m in members[cluster_id]])
-                )
+                centroid = _normalized(_mean_vector([m.embedding for m in members[cluster_id]]))
                 centroids[cluster_id] = centroid
             repo.assign_pain_cluster(conn, pain.id, cluster_id)
             counters["pains"] += 1
@@ -380,28 +409,24 @@ def run_cluster(conn: Connection) -> StageStats:
             kind_mix: dict[str, int] = {}
             for member in member_pains:
                 kind_mix[member.kind] = kind_mix.get(member.kind, 0) + 1
-            repo.update_cluster_stats(conn, cluster_id,
-                                      len(member_pains), kind_mix)
-        counters["singletons"] = sum(
-            1 for group in members.values() if len(group) == 1
-        )
+            repo.update_cluster_stats(conn, cluster_id, len(member_pains), kind_mix)
+        counters["singletons"] = sum(1 for group in members.values() if len(group) == 1)
         counters["embedded"] = int(embedded_counts.get("embedded", 0))
-        repo.update_run_stage(conn, run_id, "cluster", "running",
-                              stats_delta=dict(counters))
+        repo.update_run_stage(conn, run_id, "cluster", "running", stats_delta=dict(counters))
     finally:
         status = "done" if counters["pains"] == len(pains) else "error"
         # The deltas were already written once above; _stats_merge
         # accumulates, so the final update contributes a zero delta and
         # only flips the stage status.
         zero_delta = dict.fromkeys(counters, 0)
-        repo.update_run_stage(conn, run_id, "cluster", status,
-                              stats_delta=zero_delta)
+        repo.update_run_stage(conn, run_id, "cluster", status, stats_delta=zero_delta)
         repo.finish_run(conn, run_id)
     return dict(counters)
 
 
-def _nearest_cluster(centroids: dict[str, list[float]], vector: list[float],
-                     threshold: float) -> str | None:
+def _nearest_cluster(
+    centroids: dict[str, list[float]], vector: list[float], threshold: float
+) -> str | None:
     """Return the first cluster id whose centroid is within ``threshold``.
 
     Cosine similarity is plain dot product here: embeddings and centroids
@@ -467,8 +492,11 @@ def run_score(conn: Connection) -> StageStats:
         return {"clusters": 0, "scored": 0, "rejected": 0, "sanity_flag": 0}
 
     repo.upsert_prompt_version(
-        conn, SCORE_PROMPT_NAME, SCORE_PROMPT_VERSION,
-        load_score_template(), "file",
+        conn,
+        SCORE_PROMPT_NAME,
+        SCORE_PROMPT_VERSION,
+        load_score_template(),
+        "file",
     )
     run_id = repo.create_run(conn, {"score": "running"})
     provider = repo.get_active_llm_provider(conn)
@@ -476,14 +504,11 @@ def run_score(conn: Connection) -> StageStats:
         # Owner UPDATE 2026-09-17: scoring runs on the fake provider —
         # its fixture-derived raw-pain answers are extract-shaped, not
         # score JSON, so the stage swaps in the score-format fake.
-        client = FakeScoreLlmClient(
-            model=provider.model or "fake", provider_name=provider.name
-        )
+        client = FakeScoreLlmClient(model=provider.model or "fake", provider_name=provider.name)
     else:
         client = build_llm_client(conn)
 
-    counters = {"clusters": len(clusters), "scored": 0, "rejected": 0,
-                "sanity_flag": 0}
+    counters = {"clusters": len(clusters), "scored": 0, "rejected": 0, "sanity_flag": 0}
     totals: list[float] = []
     try:
         for cluster in clusters:
@@ -498,9 +523,7 @@ def run_score(conn: Connection) -> StageStats:
                 )
             )
             try:
-                answer = parse_score_response(
-                    client.complete(prompt).text, cluster.bodies
-                )
+                answer = parse_score_response(client.complete(prompt).text, cluster.bodies)
             except InvalidScoreResponseError:
                 # Rejected output: the cluster stays unscored, the run
                 # moves to the next one (SCORING.md rule 2: no rationale /
@@ -526,16 +549,15 @@ def run_score(conn: Connection) -> StageStats:
             counters["sanity_flag"] = 1
             LOGGER.warning(
                 "run_score: score distribution is suspiciously narrow "
-                "(%d scores within %.1f points)", len(totals),
+                "(%d scores within %.1f points)",
+                len(totals),
                 max(totals) - min(totals),
             )
-        repo.update_run_stage(conn, run_id, "score", "running",
-                              stats_delta=dict(counters))
+        repo.update_run_stage(conn, run_id, "score", "running", stats_delta=dict(counters))
     finally:
         status = "done" if counters["scored"] + counters["rejected"] == len(clusters) else "error"
         # Deltas were written once above; the final update only flips the
         # stage status (_stats_merge accumulates).
-        repo.update_run_stage(conn, run_id, "score", status,
-                              stats_delta=dict.fromkeys(counters, 0))
+        repo.update_run_stage(conn, run_id, "score", status, stats_delta=dict.fromkeys(counters, 0))
         repo.finish_run(conn, run_id)
     return dict(counters)
