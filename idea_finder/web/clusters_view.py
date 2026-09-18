@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Final, LiteralString
+from typing import Final, Literal, LiteralString
 
 from psycopg import Connection, sql
 
@@ -26,9 +26,12 @@ _LIST_CLUSTERS_SQL: Final[LiteralString] = """
            cluster.size,
            cluster.kind_mix,
            score.total,
-           cluster.created_at
+           cluster.created_at,
+           cluster.feedback,
+           cluster.split_flag
     FROM cluster
     LEFT JOIN score ON score.cluster_id = cluster.id
+    WHERE ({hide_clause})
     ORDER BY score.total DESC NULLS LAST, cluster.size DESC, cluster.created_at DESC
 """
 
@@ -39,16 +42,23 @@ _CLUSTERS_WITH_FILTERS_SQL: Final[LiteralString] = """
            cluster.size,
            cluster.kind_mix,
            score.total,
-           cluster.created_at
+           cluster.created_at,
+           cluster.feedback,
+           cluster.split_flag
     FROM cluster
     LEFT JOIN score ON score.cluster_id = cluster.id
     LEFT JOIN pain ON pain.cluster_id = cluster.id
     LEFT JOIN raw_post ON raw_post.id = pain.raw_post_id
     LEFT JOIN source ON source.id = raw_post.source_id
-    WHERE ({conditions})
-    GROUP BY cluster.id, score.total
+    WHERE ({hide_clause}) AND ({conditions})
+    GROUP BY cluster.id, score.total, cluster.feedback, cluster.split_flag
     ORDER BY score.total DESC NULLS LAST, cluster.size DESC, cluster.created_at DESC
 """
+
+#: «Скрытые не видны без фильтра» (T315): the default listing drops
+#: feedback='hidden' clusters; include_hidden brings them back.
+_HIDE_DEFAULT_SQL: Final[LiteralString] = "cluster.feedback IS DISTINCT FROM 'hidden'"
+_HIDE_NONE_SQL: Final[LiteralString] = "TRUE"
 
 #: Rubric score 0-10.
 MAX_SCORE: Final[int] = 10
@@ -69,15 +79,21 @@ class ClusterRow:
     created_at: datetime
     #: Distinct source names behind the cluster's pains, alphabetically sorted.
     sources: tuple[str, ...]
+    #: Owner feedback label (T315): 'interesting' | 'hidden' | None.
+    feedback: Literal["interesting", "hidden"] | None = None
+    #: «Это не одна боль» calibration flag (T315).
+    split_flag: bool = False
 
 
 def _build_rows(
     conn: Connection,
-    rows: list[tuple[str, str, int, object, float | None, datetime]],
+    rows: list[tuple[str, str, int, object, float | None, datetime, str | None, bool]],
 ) -> list[ClusterRow]:
     """Assemble ClusterRow list (kind_mix parse + per-cluster sources)."""
-    base: list[tuple[str, str, int, dict[str, int], float | None, datetime]] = []
-    for cluster_id, title, size, kind_mix, total, created_at in rows:
+    base: list[
+        tuple[str, str, int, dict[str, int], float | None, datetime, str | None, bool]
+    ] = []
+    for cluster_id, title, size, kind_mix, total, created_at, feedback, split_flag in rows:
         raw_mix = kind_mix if isinstance(kind_mix, dict) else json.loads(str(kind_mix))
         kinds = {str(kind): int(count) for kind, count in raw_mix.items()}
         base.append(
@@ -88,10 +104,21 @@ def _build_rows(
                 kinds,
                 None if total is None else float(total),
                 created_at,
+                None if feedback is None else str(feedback),
+                bool(split_flag),
             )
         )
     clusters: list[ClusterRow] = []
-    for cluster_id, title, size, kinds, score_value, created_at in base:
+    for (
+        cluster_id,
+        title,
+        size,
+        kinds,
+        score_value,
+        created_at,
+        feedback,
+        split_flag,
+    ) in base:
         source_rows = conn.execute(
             """
             SELECT DISTINCT source.name
@@ -103,6 +130,9 @@ def _build_rows(
             """,
             (cluster_id,),
         ).fetchall()
+        feedback_typed: Literal["interesting", "hidden"] | None = (
+            feedback if feedback in ("interesting", "hidden") else None
+        )
         clusters.append(
             ClusterRow(
                 id=cluster_id,
@@ -112,19 +142,25 @@ def _build_rows(
                 score=score_value,
                 created_at=created_at,
                 sources=tuple(str(name) for (name,) in source_rows),
+                feedback=feedback_typed,
+                split_flag=split_flag,
             )
         )
     return clusters
 
 
-def list_clusters(conn: Connection) -> list[ClusterRow]:
+def list_clusters(conn: Connection, *, include_hidden: bool = False) -> list[ClusterRow]:
     """Return every cluster with its score, sorted by score (best first).
 
     Ties fall back to cluster size, then creation time, so the page order is
     deterministic across reruns. Clusters without a score sort after scored
-    ones (``score`` is None).
+    ones (``score`` is None). Hidden clusters (``feedback = 'hidden'``) are
+    dropped unless ``include_hidden`` is set (T315: «скрытые не видны без
+    фильтра»).
     """
-    rows = conn.execute(_LIST_CLUSTERS_SQL).fetchall()
+    hide = _HIDE_NONE_SQL if include_hidden else _HIDE_DEFAULT_SQL
+    query = sql.SQL(_LIST_CLUSTERS_SQL).format(hide_clause=sql.SQL(hide))
+    rows = conn.execute(query).fetchall()
     return _build_rows(conn, rows)
 
 
@@ -189,15 +225,23 @@ def _filter_conditions(filters: ClusterFilters) -> list[sql.Composed | sql.SQL]:
     return conditions
 
 
-def list_clusters_filtered(conn: Connection, filters: ClusterFilters) -> list[ClusterRow]:
+def list_clusters_filtered(
+    conn: Connection,
+    filters: ClusterFilters,
+    *,
+    include_hidden: bool = False,
+) -> list[ClusterRow]:
     """Filtered :func:`list_clusters`; same ordering, combined filters AND."""
     conditions = _filter_conditions(filters)
     if not conditions:
-        return list_clusters(conn)
+        return list_clusters(conn, include_hidden=include_hidden)
     where = sql.SQL(" AND ").join(
         sql.SQL("(") + condition + sql.SQL(")") for condition in conditions
     )
-    query = sql.SQL(_CLUSTERS_WITH_FILTERS_SQL).format(conditions=where)
+    hide = _HIDE_NONE_SQL if include_hidden else _HIDE_DEFAULT_SQL
+    query = sql.SQL(_CLUSTERS_WITH_FILTERS_SQL).format(
+        hide_clause=sql.SQL(hide), conditions=where
+    )
     rows = conn.execute(query).fetchall()
     return _build_rows(conn, rows)
 
