@@ -1,10 +1,9 @@
-"""Read-only dashboard queries for the Clusters page (task 311).
+"""Read-only dashboard queries for the Clusters page (tasks 311/312).
 
 Schema ownership note (task 311 constraint): ``db/repo.py`` is shared with
-the parallel extract-stage stream, so this module keeps the two read queries
-the web layer needs here instead of editing repo.py. TODO(repo): move both
-functions into ``db/repo.py`` once the extract stream merges; keep the
-signatures and SQL as-is.
+the extract/score streams, so the read queries the web layer needs live here
+instead of repo.py. TODO(repo): move all functions below into ``db/repo.py``
+once the parallel streams merge; keep the signatures and SQL as-is.
 
 Everything here is read-only SELECTs; the dashboard never writes.
 """
@@ -13,10 +12,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Final, LiteralString
 
-from psycopg import Connection
+from psycopg import Connection, sql
 
 #: Score rows are optional per cluster (score stage may not have run yet).
 #: Sort missing scores last: NULLS LAST keeps unassessed clusters below any
@@ -32,6 +31,27 @@ _LIST_CLUSTERS_SQL: Final[LiteralString] = """
     LEFT JOIN score ON score.cluster_id = cluster.id
     ORDER BY score.total DESC NULLS LAST, cluster.size DESC, cluster.created_at DESC
 """
+
+#: Filtered ordering: parameterized WHERE comes before ORDER BY.
+_CLUSTERS_WITH_FILTERS_SQL: Final[LiteralString] = """
+    SELECT cluster.id,
+           cluster.title,
+           cluster.size,
+           cluster.kind_mix,
+           score.total,
+           cluster.created_at
+    FROM cluster
+    LEFT JOIN score ON score.cluster_id = cluster.id
+    LEFT JOIN pain ON pain.cluster_id = cluster.id
+    LEFT JOIN raw_post ON raw_post.id = pain.raw_post_id
+    LEFT JOIN source ON source.id = raw_post.source_id
+    WHERE ({conditions})
+    GROUP BY cluster.id, score.total
+    ORDER BY score.total DESC NULLS LAST, cluster.size DESC, cluster.created_at DESC
+"""
+
+#: Rubric score 0-10.
+MAX_SCORE: Final[int] = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,14 +71,11 @@ class ClusterRow:
     sources: tuple[str, ...]
 
 
-def list_clusters(conn: Connection) -> list[ClusterRow]:
-    """Return every cluster with its score, sorted by score (best first).
-
-    Ties fall back to cluster size, then creation time, so the page order is
-    deterministic across reruns. Clusters without a score sort after scored
-    ones (``score`` is None).
-    """
-    rows = conn.execute(_LIST_CLUSTERS_SQL).fetchall()
+def _build_rows(
+    conn: Connection,
+    rows: list[tuple[str, str, int, object, float | None, datetime]],
+) -> list[ClusterRow]:
+    """Assemble ClusterRow list (kind_mix parse + per-cluster sources)."""
     base: list[tuple[str, str, int, dict[str, int], float | None, datetime]] = []
     for cluster_id, title, size, kind_mix, total, created_at in rows:
         raw_mix = kind_mix if isinstance(kind_mix, dict) else json.loads(str(kind_mix))
@@ -100,7 +117,210 @@ def list_clusters(conn: Connection) -> list[ClusterRow]:
     return clusters
 
 
+def list_clusters(conn: Connection) -> list[ClusterRow]:
+    """Return every cluster with its score, sorted by score (best first).
+
+    Ties fall back to cluster size, then creation time, so the page order is
+    deterministic across reruns. Clusters without a score sort after scored
+    ones (``score`` is None).
+    """
+    rows = conn.execute(_LIST_CLUSTERS_SQL).fetchall()
+    return _build_rows(conn, rows)
+
+
 def count_clusters(conn: Connection) -> int:
     """Return the number of cluster rows (empty-state check for the page)."""
     row = conn.execute("SELECT count(*) FROM cluster").fetchone()
     return int(row[0]) if row is not None else 0
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterFilters:
+    """Combined cluster-list filters (task 312).
+
+    All fields optional: None/empty means «not filtered». ``kinds`` matches
+    against ``cluster.kind_mix`` (a cluster passes when at least one of its
+    kinds is in the set). ``min_score`` is an inclusive floor on
+    ``score.total``; clusters without a score fail it. ``from``/``to`` bound
+    ``cluster.created_at`` inclusively.
+    """
+
+    kinds: frozenset[str] | None = None
+    sources: frozenset[str] | None = None
+    min_score: float | None = None
+    from_date: date | None = None
+    to_date: date | None = None
+
+
+def _filter_conditions(filters: ClusterFilters) -> list[sql.Composed | sql.SQL]:
+    """Render WHERE fragments for the set filters (AND across them)."""
+    conditions: list[sql.Composed | sql.SQL] = []
+    if filters.kinds:
+        kinds = sorted(filters.kinds)
+        conditions.append(
+            sql.SQL("cluster.kind_mix ?| array[{}]").format(
+                sql.SQL(", ").join(sql.Literal(kind) for kind in kinds)
+            )
+        )
+    if filters.sources:
+        names = sorted(filters.sources)
+        conditions.append(
+            sql.SQL("source.name = ANY({})").format(
+                sql.SQL("ARRAY[{}]").format(sql.SQL(", ").join(sql.Literal(name) for name in names))
+            )
+        )
+    if filters.min_score is not None:
+        conditions.append(
+            sql.SQL("score.total >= {}").format(sql.Literal(float(filters.min_score)))
+        )
+    if filters.from_date is not None:
+        conditions.append(
+            sql.SQL("cluster.created_at >= date {}").format(
+                sql.Literal(filters.from_date.isoformat())
+            )
+        )
+    if filters.to_date is not None:
+        # Inclusive upper bound: created_at carries a time component.
+        conditions.append(
+            sql.SQL("cluster.created_at < date {} + interval '1 day'").format(
+                sql.Literal(filters.to_date.isoformat())
+            )
+        )
+    return conditions
+
+
+def list_clusters_filtered(conn: Connection, filters: ClusterFilters) -> list[ClusterRow]:
+    """Filtered :func:`list_clusters`; same ordering, combined filters AND."""
+    conditions = _filter_conditions(filters)
+    if not conditions:
+        return list_clusters(conn)
+    where = sql.SQL(" AND ").join(
+        sql.SQL("(") + condition + sql.SQL(")") for condition in conditions
+    )
+    query = sql.SQL(_CLUSTERS_WITH_FILTERS_SQL).format(conditions=where)
+    rows = conn.execute(query).fetchall()
+    return _build_rows(conn, rows)
+
+
+def list_source_names(conn: Connection) -> list[str]:
+    """Distinct source names that have pains attached (filter dropdown)."""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT source.name
+        FROM source
+        JOIN raw_post ON raw_post.source_id = source.id
+        JOIN pain ON pain.raw_post_id = raw_post.id
+        ORDER BY source.name
+        """
+    ).fetchall()
+    return [str(name) for (name,) in rows]
+
+
+@dataclass(frozen=True, slots=True)
+class PainDetail:
+    """One pain inside the cluster card, with its originating post/source."""
+
+    body: str
+    audience: str
+    quote: str
+    source_name: str
+    post_title: str
+    post_url: str
+    kind: str
+    published_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterDetail:
+    """Everything the cluster card renders (task 312)."""
+
+    id: str
+    title: str
+    size: int
+    kinds: dict[str, int]
+    score: float | None
+    rationale_md: str | None
+    quotes: tuple[str, ...]
+    created_at: datetime
+    pains: tuple[PainDetail, ...]
+    sources: tuple[str, ...]
+
+
+def get_cluster_detail(conn: Connection, cluster_id: str) -> ClusterDetail | None:
+    """Return the full card payload for one cluster, or None if unknown.
+
+    Pains come with their raw post and source so the card can link back;
+    ordering by pain id (UUIDv7) keeps the list stable across reruns.
+    """
+    head = conn.execute(
+        """
+        SELECT cluster.id,
+               cluster.title,
+               cluster.size,
+               cluster.kind_mix,
+               score.total,
+               score.rationale_md,
+               score.quotes_json,
+               cluster.created_at
+        FROM cluster
+        LEFT JOIN score ON score.cluster_id = cluster.id
+        WHERE cluster.id = %s
+        """,
+        (cluster_id,),
+    ).fetchone()
+    if head is None:
+        return None
+    (
+        cluster_key,
+        title,
+        size,
+        kind_mix,
+        total,
+        rationale_md,
+        quotes,
+        created_at,
+    ) = head
+    raw_mix = kind_mix if isinstance(kind_mix, dict) else json.loads(str(kind_mix))
+    pain_rows = conn.execute(
+        """
+        SELECT pain.body,
+               pain.audience,
+               pain.quote,
+               source.name,
+               raw_post.title,
+               raw_post.url,
+               raw_post.kind,
+               raw_post.published_at
+        FROM pain
+        JOIN raw_post ON raw_post.id = pain.raw_post_id
+        JOIN source ON source.id = raw_post.source_id
+        WHERE pain.cluster_id = %s
+        ORDER BY pain.id
+        """,
+        (cluster_id,),
+    ).fetchall()
+    pains = tuple(
+        PainDetail(
+            body=str(body),
+            audience=str(audience),
+            quote=str(quote),
+            source_name=str(source_name),
+            post_title=str(post_title),
+            post_url=str(post_url),
+            kind=str(kind),
+            published_at=published_at,
+        )
+        for body, audience, quote, source_name, post_title, post_url, kind, published_at in pain_rows
+    )
+    return ClusterDetail(
+        id=str(cluster_key),
+        title=str(title),
+        size=int(size),
+        kinds={str(k): int(v) for k, v in raw_mix.items()},
+        score=None if total is None else float(total),
+        rationale_md=None if rationale_md is None else str(rationale_md),
+        quotes=tuple(str(q) for q in quotes) if quotes is not None else (),
+        created_at=created_at,
+        pains=pains,
+        sources=tuple(sorted({pain.source_name for pain in pains})),
+    )
