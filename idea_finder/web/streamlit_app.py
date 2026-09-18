@@ -35,6 +35,7 @@ from idea_finder.web.clusters_view import (
 from idea_finder.web.health_view import SourceHealthRow, health_report
 from idea_finder.web.prompts_view import render_prompts_page
 from idea_finder.web.run_view import RunRow, has_active_run, list_runs, run_command, stage_progress
+from idea_finder.web.settings_view import render_settings_page
 from idea_finder.web.sources_view import render_sources_page
 
 logger = logging.getLogger(__name__)
@@ -367,6 +368,8 @@ def main() -> None:
         render_prompts_page()
     elif page == "Источники":
         render_sources_page()
+    elif page == "Настройки LLM":
+        render_settings_page()
     else:
         _render_placeholder_page(page)
 
