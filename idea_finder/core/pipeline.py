@@ -22,7 +22,10 @@ Usage (smoke)::
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Callable
+from dataclasses import replace
 from typing import Final
 
 from psycopg import Connection
@@ -53,6 +56,10 @@ from idea_finder.llm.score import (
     parse_score_response,
     render_score_prompt,
 )
+from idea_finder.sources.base import SourceAdapter
+from idea_finder.sources.fl_ru import FlRuAdapter
+from idea_finder.sources.gplay import GPlayAdapter
+from idea_finder.sources.habr import HabrAdapter
 
 LOGGER = logging.getLogger(__name__)
 
@@ -172,19 +179,80 @@ def _store_pains(conn: Connection, post_id: str, pains: list[Pain],
         )
 
 
-def _skeleton_stage(conn: Connection, name: str) -> StageStats:
-    """Shared skeleton body: own transaction, announce, zero counters."""
-    with conn.transaction():
-        LOGGER.info("stage %s not implemented", name)
-    return {"rows": 0}
+#: Registry mapping ``source.name`` rows to adapter factories. The factory
+#: takes the row's ``rate_limit_rps`` so each adapter tunes its limiter
+#: from the operator-tuned value (default 1 rps, migration 003). Tests
+#: monkeypatch this dict — real network is never touched in the suite.
+_ADAPTERS: Final[dict[str, Callable[[float], SourceAdapter]]] = {
+    "fl_ru": lambda rate: FlRuAdapter(),
+    "habr": lambda rate: HabrAdapter(rate_limit_rps=rate),
+    "gplay": lambda rate: GPlayAdapter(),
+}
 
 
 def run_collect(conn: Connection) -> StageStats:
-    """Fetch new posts from all enabled sources into ``raw_post``.
+    """Fetch new posts from all enabled sources into ``raw_post`` (T335, B5).
 
-    Implemented in task B-flow (source adapters).
+    Orchestrates the source adapters (T301-T304, library layer): enabled
+    rows from ``source`` (operator-controlled via the dashboard), each
+    served by its registry adapter, async ``fetch_new`` bridged to sync at
+    the stage boundary. Records land through
+    :func:`repo.insert_raw_post` — its ``url_canon`` UNIQUE + DO NOTHING
+    makes the stage idempotent (a rerun with no new feed items collects
+    nothing).
+
+    One failing source never fails the stage (isolation pattern from the
+    gplay adapter): the error is counted in ``warnings``, the remaining
+    sources still deliver. A ``source`` row whose name has no registered
+    adapter counts as a warning too. Records only ever enter via ``repo``.
+
+    Returns ``{"collected": N, "skipped": D, "warnings": W}`` — new rows,
+    URL duplicates, and failed/unknown sources respectively.
     """
-    return _skeleton_stage(conn, "collect")
+    enabled = repo.list_enabled_sources(conn)
+    run_id = repo.create_run(conn, {"collect": "running"})
+    counters = {"collected": 0, "skipped": 0, "warnings": 0}
+    try:
+        for name, rate in enabled:
+            adapter_factory = _ADAPTERS.get(name)
+            if adapter_factory is None:
+                # A source row without a registered adapter is an
+                # operator/registry mismatch, not a network flap.
+                LOGGER.warning("collect: no adapter registered for %s", name)
+                counters["warnings"] += 1
+                continue
+            source_id = repo.ensure_source(conn, name)
+            try:
+                posts = asyncio.run(adapter_factory(rate).fetch_new(None))
+            except Exception as e:  # noqa: BLE001 - per-source isolation
+                LOGGER.warning(
+                    "collect: source %s failed, skipped: %s: %s",
+                    name, type(e).__name__, e,
+                )
+                counters["warnings"] += 1
+                continue
+            # raw_post.source_id is a uuid FK: the adapter's registry name
+            # maps onto the source row id before insert.
+            for post in posts:
+                db_post = replace(post, source_id=source_id)
+                if repo.insert_raw_post(conn, db_post) is None:
+                    counters["skipped"] += 1
+                else:
+                    counters["collected"] += 1
+        repo.update_run_stage(conn, run_id, "collect", "done",
+                              stats_delta=dict(counters))
+    except Exception:
+        repo.update_run_stage(conn, run_id, "collect", "error",
+                              stats_delta=dict(counters))
+        raise
+    finally:
+        # The deltas were written once above; this update only flips the
+        # stage status (_stats_merge accumulates) and closes the run even
+        # on a crash mid-loop — a run row never hangs "running".
+        repo.update_run_stage(conn, run_id, "collect", "done",
+                              stats_delta=dict.fromkeys(counters, 0))
+        repo.finish_run(conn, run_id)
+    return dict(counters)
 
 
 def run_cluster(conn: Connection) -> StageStats:
