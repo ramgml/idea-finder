@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ClusterInputPain",
+    "ClusterScoreInput",
     "LlmProviderRecord",
     "RepoError",
     "assign_pain_cluster",
@@ -43,6 +44,7 @@ __all__ = [
     "insert_raw_post",
     "insert_score",
     "list_cluster_input_pains",
+    "list_clusters_without_score",
     "list_enabled_sources",
     "list_posts_pending_extract",
     "reset_cluster_assignment",
@@ -301,6 +303,61 @@ def assign_pain_cluster(conn: Connection, pain_id: str, cluster_id: str) -> None
         if cursor.rowcount == 0:
             msg = f"assign_pain_cluster: unknown pain id {pain_id}"
             raise RepoError(msg)
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterScoreInput:
+    """One unscored cluster plus the pain facts the rubric needs."""
+
+    id: str
+    size: int
+    kind_mix: dict[str, int]
+    sources: int
+    first_seen: str
+    last_seen: str
+    bodies: list[str]
+
+
+def list_clusters_without_score(conn: Connection) -> list[ClusterScoreInput]:
+    """Return clusters that have no score yet, in deterministic order.
+
+    The score stage runs the rubric prompt per cluster; clusters already
+    carrying a score are skipped (re-scoring is explicit, not implicit).
+    ``sources`` counts distinct feeds and the ``first_seen``/``last_seen``
+    bounds come from the member posts via ``raw_post.created_at``.
+    """
+    rows = conn.execute(
+        """
+        SELECT c.id::text, c.size, c.kind_mix,
+               count(DISTINCT p.raw_post_id) AS sources,
+               min(r.created_at)::text, max(r.created_at)::text,
+               array_agg(p.body ORDER BY p.created_at, p.id) AS bodies
+        FROM cluster c
+        JOIN pain p ON p.cluster_id = c.id
+        JOIN raw_post r ON r.id = p.raw_post_id
+        LEFT JOIN score s ON s.cluster_id = c.id
+        WHERE s.id IS NULL
+        GROUP BY c.id, c.size, c.kind_mix
+        ORDER BY min(r.created_at), c.id
+        """
+    ).fetchall()
+    result: list[ClusterScoreInput] = []
+    for (cluster_id, size, kind_mix, sources, first_seen, last_seen,
+         bodies) in rows:
+        raw_mix: object = kind_mix
+        mix = raw_mix if isinstance(raw_mix, dict) else json.loads(str(raw_mix))
+        result.append(
+            ClusterScoreInput(
+                id=str(cluster_id),
+                size=int(size),
+                kind_mix={str(k): int(v) for k, v in dict(mix).items()},
+                sources=int(sources),
+                first_seen=str(first_seen),
+                last_seen=str(last_seen),
+                bodies=[str(body) for body in (bodies or [])],
+            )
+        )
+    return result
 
 
 def reset_cluster_assignment(conn: Connection) -> int:
