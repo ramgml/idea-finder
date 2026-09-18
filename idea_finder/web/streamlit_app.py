@@ -21,7 +21,15 @@ from psycopg import Connection
 
 from idea_finder.db.bootstrap_pgserver import DbError, ensure_pgserver
 from idea_finder.db.migrate import apply_migrations
-from idea_finder.web.clusters_view import ClusterRow, list_clusters
+from idea_finder.web.clusters_view import (
+    MAX_SCORE,
+    ClusterFilters,
+    ClusterRow,
+    get_cluster_detail,
+    list_clusters,
+    list_clusters_filtered,
+    list_source_names,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +73,7 @@ def _connect() -> Connection | None:
     cluster restarts between reruns.
     """
     try:
-        handle = st.cache_resource(lambda: ensure_pgserver())()
+        handle = ensure_pgserver()  # PGDATA_DIR is read per call
         conn = handle.get_conn()
         apply_migrations(conn)
     except (DbError, OSError) as e:
@@ -110,7 +118,7 @@ def _clusters_dataframe(rows: list[ClusterRow]) -> pd.DataFrame:
 
 
 def _render_clusters_page() -> None:
-    """Clusters page: score-sorted table, empty state, graceful DB-down."""
+    """Clusters page: filters, score-sorted table, card, empty states."""
     st.title("Кластеры")
     conn = _connect()
     if conn is None:
@@ -120,6 +128,41 @@ def _render_clusters_page() -> None:
     if not rows:
         st.info(_EMPTY_STATE_TEXT)
         return
+    filters = _render_filters(conn)
+    visible = list_clusters_filtered(conn, filters) if filters != ClusterFilters() else rows
+    _render_clusters_table(visible)
+    st.caption(
+        "Сортировка по скору (лучшие сверху); кластеры без оценки — в конце. "
+        "«обновлено» — по created_at кластера."
+    )
+    if visible:
+        _render_cluster_card(conn, visible)
+
+
+def _render_filters(conn: Connection) -> ClusterFilters:
+    """Filter row: kind, sources, min score, date range (combined with AND)."""
+    with st.container(horizontal=True):
+        kinds = st.multiselect(
+            "Тип сигнала",
+            ("demand", "complaint", "discussion"),
+            format_func=lambda kind: _KIND_LABELS.get(str(kind), str(kind)),
+        )
+        source_names = list_source_names(conn)
+        sources = st.multiselect("Источники", source_names)
+        min_score = st.slider("Минимальный скор", 0.0, float(MAX_SCORE), 0.0, step=0.5)
+        from_date = st.date_input("Создан с", value=None)
+        to_date = st.date_input("Создан по", value=None)
+    return ClusterFilters(
+        kinds=frozenset(kinds) if kinds else None,
+        sources=frozenset(sources) if sources else None,
+        min_score=min_score if min_score > 0.0 else None,
+        from_date=from_date,
+        to_date=to_date,
+    )
+
+
+def _render_clusters_table(rows: list[ClusterRow]) -> None:
+    """The filtered clusters table."""
     st.dataframe(
         _clusters_dataframe(rows),
         hide_index=True,
@@ -128,10 +171,44 @@ def _render_clusters_page() -> None:
             "size": st.column_config.NumberColumn(),
         },
     )
-    st.caption(
-        "Сортировка по скору (лучшие сверху); кластеры без оценки — в конце. "
-        "«обновлено» — по created_at кластера."
-    )
+
+
+def _render_cluster_card(conn: Connection, rows: list[ClusterRow]) -> None:
+    """Master-detail card: pick a cluster, see rationale, quotes, pains."""
+    labels = {
+        f"{row.title} — скор {row.score:.2f}"
+        if row.score is not None
+        else f"{row.title} — без оценки": row.id
+        for row in rows
+    }
+    chosen = st.selectbox("Карточка кластера", list(labels), index=0)
+    detail = get_cluster_detail(conn, labels[chosen])
+    if detail is None:
+        st.warning("Кластер не найден.")
+        return
+    header_cols = st.columns(4)
+    header_cols[0].metric("Скор", "—" if detail.score is None else f"{detail.score:.2f}")
+    header_cols[1].metric("Размер", str(detail.size))
+    header_cols[2].metric("Типы", _format_kinds(detail.kinds))
+    header_cols[3].metric("Источники", str(len(detail.sources)))
+    if detail.rationale_md:
+        st.subheader("Обоснование")
+        st.markdown(detail.rationale_md)
+    if detail.quotes:
+        st.subheader("Цитаты")
+        for quote in detail.quotes:
+            st.markdown(f"> {quote}")
+    st.subheader(f"Боли ({len(detail.pains)})")
+    for pain in detail.pains:
+        date_suffix = f" · {pain.published_at:%d.%m.%Y}" if pain.published_at is not None else ""
+        with st.expander(
+            f"{_KIND_LABELS.get(pain.kind, pain.kind)} · {pain.source_name} · "
+            f"{pain.post_title}{date_suffix}"
+        ):
+            st.markdown(pain.body)
+            st.caption(f"Аудитория: {pain.audience}")
+            st.markdown(f"> {pain.quote}")
+            st.link_button("Открыть пост", pain.post_url)
 
 
 def _render_placeholder_page(title: str) -> None:
