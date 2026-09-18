@@ -13,7 +13,9 @@ Run: ``uv run streamlit run idea_finder/web/streamlit_app.py``
 from __future__ import annotations
 
 import logging
+import subprocess
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -30,13 +32,16 @@ from idea_finder.web.clusters_view import (
     list_clusters_filtered,
     list_source_names,
 )
+from idea_finder.web.health_view import SourceHealthRow, health_report
 from idea_finder.web.prompts_view import render_prompts_page
+from idea_finder.web.run_view import RunRow, has_active_run, list_runs, run_command, stage_progress
 
 logger = logging.getLogger(__name__)
 
 #: Sidebar page titles, in navigation order.
 _PAGE_TITLES: tuple[str, ...] = (
     "Кластеры",
+    "Сбор",
     "Источники",
     "Промпты",
     "Настройки LLM",
@@ -212,6 +217,134 @@ def _render_cluster_card(conn: Connection, rows: list[ClusterRow]) -> None:
             st.link_button("Открыть пост", pain.post_url)
 
 
+#: Repo root: cwd for the run subprocess (resolves cli.py + PGDATA_DIR).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _render_run_page() -> None:
+    """Run ("Сбор") page: launch button + stage progress from the run table."""
+    st.title("Сбор")
+    conn = _connect()
+    if conn is None:
+        st.error(_DB_DOWN_TEXT)
+        return
+    busy = has_active_run(conn)
+    runs = list_runs(conn, limit=5)
+    current = runs[0] if runs and runs[0].is_running else None
+    if current is not None:
+        st.info("Идёт прогон сборa — повторный запуск заблокирован, пока он не завершится.")
+    button_disabled = busy
+    if st.button(
+        "Прогнать сбор",
+        disabled=button_disabled,
+        help=(
+            "Запуск недоступен, пока выполняется другой прогон."
+            if button_disabled
+            else "Полный прогон: сбор → извлечение → кластеризация → скоринг."
+        ),
+        type="primary" if not button_disabled else "secondary",
+    ):
+        subprocess.Popen(
+            run_command(),
+            cwd=_REPO_ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+        st.success("Прогон запущен в фоне. Обновите страницу, чтобы увидеть прогресс.")
+        st.rerun()
+    st.subheader("Прогресс последнего прогона")
+    if current is not None:
+        _render_run_progress(current)
+    elif runs:
+        _render_run_progress(runs[0])
+    else:
+        st.info(
+            "Прогонов ещё не было — нажмите «Прогнать сбор» или выполните "
+            "`uv run python cli.py run`."
+        )
+    if runs:
+        st.subheader("Последние прогоны")
+        st.dataframe(_runs_dataframe(runs), hide_index=True)
+
+
+def _render_run_progress(run: RunRow) -> None:
+    """Stage progress block for one run: status + counters per stage."""
+    caption = f"Прогон от {_format_updated(run.started_at)}"
+    if run.finished_at is not None:
+        caption += f", завершён за {(run.finished_at - run.started_at).total_seconds():.0f} с"
+    st.caption(caption)
+    for progress in stage_progress(run):
+        cols = st.columns([2, 2, 6])
+        cols[0].write(f"**{progress.name}**")
+        cols[1].write(progress.status)
+        cols[2].write(progress.metrics)
+
+
+def _runs_dataframe(runs: list[RunRow]) -> pd.DataFrame:
+    """History table: one row per run, newest first."""
+    data: dict[str, list[object]] = {
+        "запущен": [_format_updated(run.started_at) for run in runs],
+        "завершён": [
+            _format_updated(run.finished_at) if run.finished_at is not None else "—" for run in runs
+        ],
+        "стадии": [
+            ", ".join(f"{stage}: {status}" for stage, status in run.stages.items()) or "—"
+            for run in runs
+        ],
+        "стоимость, ₽": [f"{run.cost:.4f}" for run in runs],
+    }
+    return pd.DataFrame(data, columns=("запущен", "завершён", "стадии", "стоимость, ₽"))
+
+
+#: Status rendering for source health rows.
+_SOURCE_WARN = "нет успешных постов"
+
+
+def _health_dataframe(sources: list[SourceHealthRow]) -> pd.DataFrame:
+    """Source health table: last success, failures, suspect-short share."""
+    data: dict[str, list[object]] = {
+        "источник": [row.name for row in sources],
+        "последний успех": [
+            _format_updated(row.last_ok) if row.last_ok is not None else _SOURCE_WARN
+            for row in sources
+        ],
+        "ошибок": [str(row.failed_count) for row in sources],
+        "всего постов": [str(row.total_count) for row in sources],
+        "suspect_short, %": [f"{row.suspect_share * 100:.0f}" for row in sources],
+    }
+    return pd.DataFrame(
+        data,
+        columns=("источник", "последний успех", "ошибок", "всего постов", "suspect_short, %"),
+    )
+
+
+def _render_health_page() -> None:
+    """Health ("Здоровье") page: run history, cost, source health."""
+    st.title("Здоровье")
+    conn = _connect()
+    if conn is None:
+        st.error(_DB_DOWN_TEXT)
+        return
+    report = health_report(conn)
+    st.subheader("История прогонов")
+    if not report.runs:
+        st.info("Прогонов ещё не было — запустите сбор на странице «Сбор».")
+    else:
+        st.dataframe(_runs_dataframe(report.runs), hide_index=True)
+        total_cost = sum(run.cost for run in report.runs)
+        st.caption(f"Суммарная стоимость последних {len(report.runs)} прогонов: {total_cost:.4f} ₽")
+    st.subheader("Здоровье источников")
+    if not report.sources:
+        st.info("Источники не настроены.")
+        return
+    st.dataframe(_health_dataframe(report.sources), hide_index=True)
+    st.caption(
+        "suspect_short — доля постов с подозрительно коротким текстом "
+        "(кандидаты на повторную экстракцию)."
+    )
+
+
 def _render_placeholder_page(title: str) -> None:
     """Placeholder for pages delivered by later F-stream tasks."""
     st.title(title)
@@ -225,6 +358,10 @@ def main() -> None:
     page = st.sidebar.radio("Навигация", _PAGE_TITLES)
     if page == "Кластеры":
         _render_clusters_page()
+    elif page == "Сбор":
+        _render_run_page()
+    elif page == "Здоровье":
+        _render_health_page()
     elif page == "Промпты":
         render_prompts_page()
     else:
