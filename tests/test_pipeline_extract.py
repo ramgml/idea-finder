@@ -259,3 +259,36 @@ def test_fake_provider_runs_extract_without_monkeypatch(conn: Connection) -> Non
     rerun = run_extract(conn)
     assert rerun["processed"] == 0
     assert table_counts(conn)["pain"] == counts["pain"]
+
+
+def test_run_row_stats_match_returned_stats(conn: Connection) -> None:
+    """The stored run row carries truthful magnitudes, not doubled ones (h).
+
+    Regression guard for the T333 fix: update_run_stage used to receive the
+    cumulative totals both per batch and in the finally block, and
+    _stats_merge accumulates — so run.stats_json doubled every counter
+    while the stage's return value was correct. The stored row is what
+    ``status`` and the dashboard read, so it must match the return.
+    """
+    upsert_llm_provider(conn, "mock", "fake", "", "mock-model", "", is_active=True)
+    fixture_text = json.loads(
+        resources.files("idea_finder")
+        .joinpath("fixtures/posts/fl_ru.json")
+        .read_text(encoding="utf-8")
+    )[0]["text"]
+    _add_post(conn, fixture_text)
+
+    returned = run_extract(conn)
+
+    run_rows = conn.execute(
+        "SELECT stats_json FROM run"
+    ).fetchall()
+    assert len(run_rows) == 1
+    stored = run_rows[0][0]
+    if not isinstance(stored, dict):
+        stored = json.loads(str(stored))
+    assert stored["processed"] == returned["processed"] == 1
+    assert stored["valid"] == returned["valid"]
+    assert stored["extracted"] == returned["extracted"]
+    assert stored["failed"] == returned["failed"] == 0
+    assert stored["cost_micro"] == returned["cost_micro"]

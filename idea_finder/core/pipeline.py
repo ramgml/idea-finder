@@ -134,12 +134,14 @@ def run_extract(conn: Connection) -> StageStats:
                              "cost_micro": _to_micro(cost_total)},
                 prompt_version_id=prompt_version_id,
             )
+        # Deltas were written with each batch; the final update only flips
+        # the stage status with a zero delta (_stats_merge accumulates, so
+        # re-sending the cumulative totals here would double the run row).
     finally:
         status = "done" if counters["llm_errors"] == 0 else "error"
         repo.update_run_stage(
             conn, run_id, "extract", status,
-            stats_delta={**counters, **extract_stats_to_dict(stats),
-                         "cost_micro": _to_micro(cost_total)},
+            stats_delta=None,
             prompt_version_id=prompt_version_id,
         )
         repo.finish_run(conn, run_id)
