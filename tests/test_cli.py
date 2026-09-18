@@ -51,6 +51,9 @@ def test_stage_command_prints_skeleton_stats(pgdata_dir: Path, stage: str) -> No
     if stage == "extract":
         # Real stage: empty database -> zero counters, no LLM provider needed.
         assert "extract: {'processed': 0," in result.stdout
+    elif stage == "cluster":
+        # Real stage: empty database -> zero counters, no embeddings needed.
+        assert "cluster: {'pains': 0," in result.stdout
     else:
         assert f"{stage}: {{'rows': 0}}" in result.stdout
 
@@ -60,10 +63,11 @@ def test_run_executes_all_stages_in_order(pgdata_dir: Path) -> None:
     result = run_cli("run")
     assert result.returncode == 0, result.stderr
     last4 = result.stdout.splitlines()[-4:]
-    # extract is real now (produces its own stats dict), other stages skeleton.
+    # extract and cluster are real now (own stats dicts); collect/score still
+    # skeleton stages from the B-/E-flows.
     assert last4[0] == "collect: {'rows': 0}"
     assert last4[1].startswith("extract: {'processed': 0,")
-    assert last4[2] == "cluster: {'rows': 0}"
+    assert last4[2].startswith("cluster: {'pains': 0,")
     assert last4[3] == "score: {'rows': 0}"
 
 

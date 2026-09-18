@@ -236,8 +236,12 @@ def run_cluster(conn: Connection) -> StageStats:
                               stats_delta=dict(counters))
     finally:
         status = "done" if counters["pains"] == len(pains) else "error"
+        # The deltas were already written once above; _stats_merge
+        # accumulates, so the final update contributes a zero delta and
+        # only flips the stage status.
+        zero_delta = dict.fromkeys(counters, 0)
         repo.update_run_stage(conn, run_id, "cluster", status,
-                              stats_delta=dict(counters))
+                              stats_delta=zero_delta)
         repo.finish_run(conn, run_id)
     return dict(counters)
 
