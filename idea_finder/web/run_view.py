@@ -145,8 +145,12 @@ def has_active_run(conn: Connection) -> bool:
 
 #: Which run.stats counters describe each stage, in render order. Keys are
 #: exact ``run.stats_json`` names written by the stages (pipeline.py).
+#:
+#: Collect (T341 P2-2): run_collect writes ``collected``/``skipped``/
+#: ``warnings`` (the old "rows" key no longer exists since T335) — a
+#: stale key here renders the Сбор stage with zero counters.
 _STAGE_METRIC_KEYS: Final[dict[str, tuple[str, ...]]] = {
-    "collect": ("rows",),
+    "collect": ("collected", "skipped", "warnings"),
     "extract": ("processed", "extracted", "failed", "llm_errors", "hallucinated"),
     "cluster": ("pains", "clusters_new", "clusters_merged", "singletons"),
     "score": ("clusters", "scored", "rejected", "sanity_flag"),
@@ -154,7 +158,9 @@ _STAGE_METRIC_KEYS: Final[dict[str, tuple[str, ...]]] = {
 
 #: Russian labels for the counter keys above.
 _METRIC_LABELS: Final[dict[str, str]] = {
-    "rows": "собрано",
+    "collected": "собрано",
+    "skipped": "дубликаты URL",
+    "warnings": "источники с ошибками",
     "processed": "обработано",
     "extracted": "извлечено",
     "failed": "брак",
