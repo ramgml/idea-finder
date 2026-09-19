@@ -76,7 +76,6 @@ from idea_finder.sources.fl_ru import FlRuAdapter
 from idea_finder.sources.gplay import GPlayAdapter
 from idea_finder.sources.habr import HabrAdapter
 from idea_finder.wordstat.client import (
-    WordstatApiError,
     WordstatClient,
     build_wordstat_client,
 )
@@ -700,20 +699,20 @@ def run_validate(
         "rationale_updated": 0,
     }
     status = "done"
-    try:
+
+    async def _validate_all() -> None:
+        """Query every cluster's phrases under one rate limiter.
+
+        One event loop for the whole stage: the ``aiolimiter`` instance
+        must live on a single loop (re-use across loops is undefined
+        behavior), and the Wordstat port is synchronous — the limiter
+        spaces the calls, the DB writes between them run inline.
+        """
         limiter = aiolimiter.AsyncLimiter(WORDSTAT_RATE_RPS, 1.0)
-
-        def _bounded_frequency(phrase: str) -> int:
-            """One rate-limited Wordstat query through the sync bridge."""
-
-            async def _one() -> int:
-                async with limiter:
-                    return wordstat.frequency(phrase)
-
-            return asyncio.run(_one())
-
         for cluster in clusters:
-            prompt = render_wordstat_prompt(_wordstat_cluster_summary(cluster, cluster.bodies))
+            prompt = render_wordstat_prompt(
+                _wordstat_cluster_summary(cluster, cluster.bodies)
+            )
             try:
                 answer = parse_phrases_response(client.complete(prompt).text)
             except InvalidPhrasesResponseError:
@@ -725,17 +724,20 @@ def run_validate(
             counters["phrases"] += len(answer.phrases)
             cluster_confirmed = False
             for phrase in answer.phrases:
-                try:
-                    frequency = _bounded_frequency(phrase)
-                except WordstatApiError as e:
-                    LOGGER.warning(
-                        "validate: wordstat query failed for %r: %s: %s",
-                        phrase,
-                        type(e).__name__,
-                        e,
-                    )
-                    counters["api_errors"] += 1
-                    continue
+                async with limiter:
+                    try:
+                        frequency = wordstat.frequency(phrase)
+                    except Exception as e:  # noqa: BLE001 - per-phrase
+                        # isolation (run_collect pattern): one dead
+                        # phrase never fails the stage or the cluster.
+                        LOGGER.warning(
+                            "validate: wordstat query failed for %r: %s: %s",
+                            phrase,
+                            type(e).__name__,
+                            e,
+                        )
+                        counters["api_errors"] += 1
+                        continue
                 repo.upsert_wordstat_query(conn, cluster.id, phrase, frequency)
                 counters["validated"] += 1
                 if frequency >= WORDSTAT_DEMAND_THRESHOLD:
@@ -744,7 +746,12 @@ def run_validate(
                 counters["demand_confirmed"] += 1
                 if _append_wordstat_signal(conn, cluster.id):
                     counters["rationale_updated"] += 1
-            repo.update_run_stage(conn, run_id, "validate", "running", stats_delta=dict(counters))
+            repo.update_run_stage(
+                conn, run_id, "validate", "running", stats_delta=dict(counters)
+            )
+
+    try:
+        asyncio.run(_validate_all())
     except Exception:
         status = "error"
         raise
