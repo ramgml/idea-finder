@@ -67,9 +67,9 @@ from idea_finder.sources.habr import HabrAdapter
 LOGGER = logging.getLogger(__name__)
 
 #: Cosine similarity above which a pain joins an existing cluster
-#: (0.88, G1-calibrated; known centroid-drift limitation on small
-#: corpora — see D3. Moved to config once the project grows a
-#: configuration surface).
+#: (first-member similarity, threshold 0.88, G1-calibrated, re-verified on
+#: the 41-pain fix corpus in T342 — see :func:`run_cluster` for why the
+#: centroid is frozen at the first member; configuration surface pending).
 CLUSTER_THRESHOLD: Final = 0.88
 
 type StageStats = dict[str, int]
@@ -346,14 +346,20 @@ def run_collect(conn: Connection) -> StageStats:
 
 
 def run_cluster(conn: Connection) -> StageStats:
-    """Embed pains and group them into clusters (T309, D2).
+    """Embed pains and group them into clusters (T309, T342/D3).
 
-    Greedy centroid clustering: pains arrive in deterministic order
+    First-member greedy clustering: pains arrive in deterministic order
     (``created_at, id``); a pain joins the first cluster whose centroid is
     within :data:`CLUSTER_THRESHOLD` cosine similarity, otherwise it opens
-    a new cluster. Centroids are the L2-renormalized mean of member
-    vectors, so the decision depends only on the partition, and a rerun
-    over unchanged input reproduces the exact same grouping.
+    a new cluster. The centroid of a cluster is the vector of its FIRST
+    member and is never updated afterwards — this is a deliberate fix of
+    the D3 centroid-drift failure mode: an L2-normalized mean of many
+    short-phrase embeddings drifts toward the corpus average (cosine
+    0.89-0.94 to any new pain), so under centroid update a single
+    attractor cluster absorbed everything. Freezing the centroid keeps
+    every decision against one fixed reference vector, so the partition
+    is order-stable and a rerun over unchanged input reproduces the exact
+    same grouping.
 
     Repeated runs are idempotent by full recompute: previous assignments
     are cleared (via :func:`repo.reset_cluster_assignment`) and every
@@ -385,12 +391,14 @@ def run_cluster(conn: Connection) -> StageStats:
     run_id = repo.create_run(conn, {"cluster": "running"})
     counters = {"pains": 0, "clusters_new": 0, "clusters_merged": 0, "singletons": 0, "embedded": 0}
     try:
-        # Partition state: cluster id -> running centroid (L2-normalized)
-        # and member pains. Recomputed greedily in deterministic order.
+        # Partition state: cluster id -> frozen first-member centroid
+        # (L2-normalized) and member pains. Greedy assignment in
+        # deterministic order; centroids never change once created.
         centroids: dict[str, list[float]] = {}
         members: dict[str, list[repo.ClusterInputPain]] = {}
         for pain in pains:
             target = _nearest_cluster(centroids, pain.embedding, CLUSTER_THRESHOLD)
+            cluster_id: str
             if target is None:
                 title = _cluster_title(pain)
                 cluster_id = repo.upsert_cluster(conn, title, size=1, kind_mix={pain.kind: 1})
@@ -401,8 +409,6 @@ def run_cluster(conn: Connection) -> StageStats:
                 cluster_id = target
                 members[cluster_id].append(pain)
                 counters["clusters_merged"] += 1
-                centroid = _normalized(_mean_vector([m.embedding for m in members[cluster_id]]))
-                centroids[cluster_id] = centroid
             repo.assign_pain_cluster(conn, pain.id, cluster_id)
             counters["pains"] += 1
 
@@ -431,7 +437,8 @@ def _nearest_cluster(
     """Return the first cluster id whose centroid is within ``threshold``.
 
     Cosine similarity is plain dot product here: embeddings and centroids
-    are L2-normalized by construction.
+    are L2-normalized by construction, and each centroid is the frozen
+    first-member vector (T342) — it does not move as members join.
     """
     best_id: str | None = None
     best_similarity = threshold
@@ -441,12 +448,6 @@ def _nearest_cluster(
             best_similarity = similarity
             best_id = cluster_id
     return best_id
-
-
-def _mean_vector(vectors: list[list[float]]) -> list[float]:
-    """Component-wise mean of equal-length vectors."""
-    length = len(vectors[0])
-    return [sum(v[i] for v in vectors) / len(vectors) for i in range(length)]
 
 
 def _normalized(vector: list[float]) -> list[float]:

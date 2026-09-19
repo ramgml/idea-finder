@@ -1,4 +1,4 @@
-"""Cluster stage tests: greedy centroid grouping, threshold, idempotency.
+"""Cluster stage tests: first-member greedy grouping, threshold, idempotency.
 
 One embedded postgres cluster per module (same pattern as
 ``test_pipeline_extract.py``). The real e5 model is never loaded: the
@@ -12,7 +12,11 @@ a. 21 pains in 3 groups with mixed kinds -> correct partition, sizes,
 b. second run reproduces the exact same partition, no orphan clusters;
 c. threshold: cosine ~0.9 merges, ~0.5 does not;
 d. empty database -> zero stats, no run row;
-e. a run row is written with stages_json.cluster == 'done'.
+e. a run row is written with stages_json.cluster == 'done';
+f. drift regression (T342): two themes whose members sit at intra-theme
+   cosine ~0.85-0.92 and cross-theme cosine ~0.80-0.84 — the regime where
+   the old centroid-update algorithm collapsed everything into one
+   attractor cluster — stay separated into exactly 2 clusters.
 """
 
 from __future__ import annotations
@@ -188,6 +192,128 @@ def _seed_groups(
             )
             n += 1
     return ids
+
+
+# --- T342 drift regression: construct vectors in the drift regime ----------
+#
+# e5-small phrases in one semantic theme have pairwise cosine ~0.85-0.92;
+# cross-theme pairs sit at ~0.80-0.84. In that regime the OLD algorithm
+# (centroid = running L2-normalized mean) failed: the mean of many
+# intra-theme vectors drifts toward the corpus average, its similarity to
+# any new vector rises to 0.89-0.94, and one attractor cluster absorbs
+# everything. The construction below reproduces this geometrically with
+# 2-D mixes: one theme is a 65/35 mix of basis directions e0/e1, the
+# other 35/65 (member noise only tilts within the same mix), so
+# intra-theme cosine stays in [0.85, 0.92] while cross-theme cosine stays
+# in [0.80, 0.84] — asserted in both tests, not assumed.
+
+_DRIFT_DIM = 384
+_MIX_A = (0.65, 0.35)
+_MIX_B = (0.35, 0.65)
+_INTRA_RANGE = (0.85, 0.92)
+_CROSS_RANGE = (0.80, 0.84)
+
+
+def _mix_vector(mix: tuple[float, float], noise: int) -> list[float]:
+    """Unit vector from a 2-D basis mix plus a small orthogonal tilt."""
+    vector = [0.0] * _DRIFT_DIM
+    vector[0] = mix[0] * (1.0 + 0.004 * noise)
+    vector[1] = mix[1] * (1.0 - 0.004 * noise)
+    vector[2 + (noise % 10)] += 0.02
+    return _unit(vector)
+
+
+def _assert_pair_ranges(vectors: dict[str, list[float]],
+                        group_of: dict[str, int]) -> None:
+    """Fail if any intra-/cross-theme pair cosine leaves its target range."""
+    bodies = list(vectors)
+    for i in range(len(bodies)):
+        for j in range(i + 1, len(bodies)):
+            similarity = _cosine(vectors[bodies[i]], vectors[bodies[j]])
+            if group_of[bodies[i]] == group_of[bodies[j]]:
+                assert _INTRA_RANGE[0] <= similarity <= _INTRA_RANGE[1], (
+                    f"intra-theme cosine {similarity:.4f} out of "
+                    f"{_INTRA_RANGE} for {bodies[i]!r} vs {bodies[j]!r}"
+                )
+            else:
+                assert _CROSS_RANGE[0] <= similarity <= _CROSS_RANGE[1], (
+                    f"cross-theme cosine {similarity:.4f} out of "
+                    f"{_CROSS_RANGE} for {bodies[i]!r} vs {bodies[j]!r}"
+                )
+
+
+def _seed_two_drift_themes(
+    conn: Connection,
+    fake_embedder: dict[str, list[float]],
+    prompt_version_id: str,
+    per_theme: int = 8,
+) -> None:
+    """Seed two themes of ``per_theme`` pains in the drift cosine regime."""
+    themes = (_MIX_A, _MIX_B)
+    for group, mix in enumerate(themes):
+        for i in range(per_theme):
+            body = f"дрейф-боль {i} тема {group}"
+            fake_embedder[body] = _mix_vector(mix, i)
+            _add_post_with_pains(conn, [body], KINDS[i % 3],
+                                 n=200 + 10 * group + i,
+                                 prompt_version_id=prompt_version_id)
+
+
+def test_cluster_drift_two_themes_do_not_collapse(
+    conn: Connection,
+    fake_embedder: dict[str, list[float]],
+    prompt_version_id: str,
+) -> None:
+    """Two drift-regime themes stay 2 clusters, not one attractor (f-a).
+
+    Falls on the old algorithm: with centroid update the first cluster's
+    running mean drifts until cross-theme vectors clear the threshold and
+    everything merges into a single cluster.
+    """
+    _seed_two_drift_themes(conn, fake_embedder, prompt_version_id)
+    _assert_pair_ranges(
+        {b: v for b, v in fake_embedder.items() if b.startswith("дрейф-боль")},
+        {b: int(b[-1]) for b in fake_embedder if b.startswith("дрейф-боль")},
+    )
+
+    stats = run_cluster(conn)
+
+    assert stats["pains"] == 16
+    assert stats["clusters_new"] == 2
+    assert stats["singletons"] == 0
+    counts = table_counts(conn)
+    assert counts["cluster"] == 2
+    sizes = sorted(
+        int(row[0])
+        for row in conn.execute("SELECT size FROM cluster").fetchall()
+    )
+    assert sizes == [8, 8]
+
+
+def test_cluster_drift_two_themes_do_not_shatter(
+    conn: Connection,
+    fake_embedder: dict[str, list[float]],
+    prompt_version_id: str,
+) -> None:
+    """Two drift-regime themes stay merged within theme, not singletons (f-b).
+
+    Falls on an over-strict fix too: intra-theme members are NOT mutually
+    nearest at raw cosine (0.85-0.92 vs threshold 0.88), so only the
+    frozen first-member anchor keeps each theme as a single cluster;
+    per-pair thresholding without it shatters into 16 singletons.
+    """
+    _seed_two_drift_themes(conn, fake_embedder, prompt_version_id)
+
+    run_cluster(conn)
+
+    sizes = sorted(
+        int(row[0])
+        for row in conn.execute("SELECT size FROM cluster").fetchall()
+    )
+    assert sizes == [8, 8]
+    counts = table_counts(conn)
+    assert counts["cluster"] == 2
+    assert counts["pain"] == 16
 
 
 # --- tests -----------------------------------------------------------------
