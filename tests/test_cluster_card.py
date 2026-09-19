@@ -29,6 +29,7 @@ from idea_finder.db.repo import (
     insert_score,
     upsert_cluster,
     upsert_prompt_version,
+    upsert_wordstat_query,
 )
 from idea_finder.web.clusters_view import (
     ClusterDetail,
@@ -351,6 +352,42 @@ def test_dashboard_card_flow(app_pg: PgHandle, monkeypatch: pytest.MonkeyPatch) 
     # Card body: rationale markdown is on the page.
     markdown_texts = [el.value for el in at.markdown]
     assert any("Рубрика подтверждает." in text for text in markdown_texts)
+
+
+def test_dashboard_card_shows_wordstat_block(
+    app_pg: PgHandle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """T321: a cluster with cached checks renders the Wordstat block."""
+
+    connection = app_pg.get_conn()
+    try:
+        cluster_id = _seed(
+            connection,
+            "card-wordstat",
+            total=6.0,
+            kinds={"demand": 1},
+            pains=[("fl.ru", "demand")],
+            rationale="Рубрика подтверждает.",
+            quotes=[],
+        )
+        upsert_wordstat_query(connection, cluster_id, "как исправить заказ", 4200)
+        upsert_wordstat_query(connection, cluster_id, "не работает заказ", 310)
+    finally:
+        connection.close()
+
+    monkeypatch.setenv("PGDATA_DIR", str(app_pg.data_dir))
+    at = AppTest.from_file(_APP, default_timeout=180)
+    at.run()
+    assert not at.exception
+    headers = [el.value for el in at.subheader]
+    assert any("Wordstat" in text for text in headers)
+    # The block's dataframe carries phrase + frequency columns.
+    frames = [el.value for el in at.dataframe]
+    assert any(
+        {"фраза", "частотность/мес"} <= set(frame.columns) and len(frame) == 2
+        for frame in frames
+        if hasattr(frame, "columns")
+    )
 
 
 def test_dashboard_filters_flow(app_pg: PgHandle, monkeypatch: pytest.MonkeyPatch) -> None:
