@@ -197,29 +197,68 @@ def _seed_groups(
 # --- T342 drift regression: construct vectors in the drift regime ----------
 #
 # e5-small phrases in one semantic theme have pairwise cosine ~0.85-0.92;
-# cross-theme pairs sit at ~0.80-0.84. In that regime the OLD algorithm
-# (centroid = running L2-normalized mean) failed: the mean of many
-# intra-theme vectors drifts toward the corpus average, its similarity to
-# any new vector rises to 0.89-0.94, and one attractor cluster absorbs
-# everything. The construction below reproduces this geometrically with
-# 2-D mixes: one theme is a 65/35 mix of basis directions e0/e1, the
-# other 35/65 (member noise only tilts within the same mix), so
-# intra-theme cosine stays in [0.85, 0.92] while cross-theme cosine stays
-# in [0.80, 0.84] — asserted in both tests, not assumed.
+# cross-theme pairs sit at ~0.80-0.84 (measured on the 41-pain fix corpus).
+# In that regime the OLD algorithm (centroid = running L2-normalized mean
+# of members) failed: averaging dilutes the per-theme component, so the
+# running centroid drifts toward the corpus-hub direction and its cosine
+# to ANY new pain rises above the threshold — one attractor cluster
+# absorbs everything.
+#
+# The vectors below reproduce that collapse with exact arithmetic (no
+# randomness, exact pairwise cosines). Each theme T in {A, B} is an
+# orthonormal basis direction e_T; the corpus hub is e0; each member adds
+# a deterministic tilt vector r_i (pairwise cosine exactly RHO = 0.26,
+# built from a regular simplex blended toward a common direction):
+#
+#   member_i(T) = norm(P*e_T + Q*r_i + H*e0),  P²=0.007 Q²=0.155 H²=0.838
+#
+# Exact consequences (asserted in tests, not assumed):
+#   intra-theme member cosine  = P² + Q²*0.26 + H²          = 0.8853
+#   cross-theme member cosine  = H²                         = 0.8380
+#   OLD running centroid after 8 members: cosine to any
+#   cross-theme vector = H² / ||mean||, ||mean||² falls toward
+#   P² + Q²*(1+7*0.26)/8 + H² = 0.8996, cosine 0.8835 >= 0.88
+#   -> the OLD algorithm collapses both themes into one cluster.
+#   NEW first-member similarity compares raw vectors (0.8853 / 0.8380)
+#   -> themes stay separate, each theme stays one cluster.
 
-_DRIFT_DIM = 384
-_MIX_A = (0.65, 0.35)
-_MIX_B = (0.35, 0.65)
+_DRIFT_DIM = DIM
 _INTRA_RANGE = (0.85, 0.92)
 _CROSS_RANGE = (0.80, 0.84)
+_P_SQ = 0.007
+_Q_SQ = 0.155
+_H_SQ = 0.838
+_RHO = 0.26
 
 
-def _mix_vector(mix: tuple[float, float], noise: int) -> list[float]:
-    """Unit vector from a 2-D basis mix plus a small orthogonal tilt."""
+def _drift_tilts(count: int, dim_offset: int) -> list[list[float]]:
+    """``count`` unit vectors with pairwise cosine exactly ``_RHO``.
+
+    Blend of a regular simplex (pairwise -1/count) toward a common
+    direction: r_i = norm(BETA*simplex_i + e_x) with
+    BETA² = (1-RHO)/(RHO+1/count), so r_i.r_j = (1-BETA²/count)/(1+BETA²).
+    """
+    beta_sq = (1.0 - _RHO) / (_RHO + 1.0 / count)
+    tilts: list[list[float]] = []
+    for i in range(count):
+        vector = [0.0] * _DRIFT_DIM
+        for d in range(count):
+            # simplex row: e_d shifted by the mean of the identity basis
+            vector[dim_offset + d] = beta_sq ** 0.5 * (
+                (1.0 if d == i else 0.0) - 1.0 / count
+            )
+        vector[dim_offset + count] = 1.0
+        tilts.append(_unit(vector))
+    return tilts
+
+
+def _drift_vector(theme: int, tilt: list[float]) -> list[float]:
+    """Member vector of ``theme`` (0 or 1) along the given tilt."""
     vector = [0.0] * _DRIFT_DIM
-    vector[0] = mix[0] * (1.0 + 0.004 * noise)
-    vector[1] = mix[1] * (1.0 - 0.004 * noise)
-    vector[2 + (noise % 10)] += 0.02
+    vector[2 + theme] = _P_SQ ** 0.5          # orthonormal theme directions
+    for d, value in enumerate(tilt):
+        vector[d] += _Q_SQ ** 0.5 * value
+    vector[0] += _H_SQ ** 0.5                 # shared corpus-hub direction
     return _unit(vector)
 
 
@@ -249,13 +288,14 @@ def _seed_two_drift_themes(
     per_theme: int = 8,
 ) -> None:
     """Seed two themes of ``per_theme`` pains in the drift cosine regime."""
-    themes = (_MIX_A, _MIX_B)
-    for group, mix in enumerate(themes):
+    tilts_per_theme = [_drift_tilts(per_theme, 10 + 30 * theme)
+                       for theme in range(2)]
+    for theme in range(2):
         for i in range(per_theme):
-            body = f"дрейф-боль {i} тема {group}"
-            fake_embedder[body] = _mix_vector(mix, i)
+            body = f"дрейф-боль {i} тема {theme}"
+            fake_embedder[body] = _drift_vector(theme, tilts_per_theme[theme][i])
             _add_post_with_pains(conn, [body], KINDS[i % 3],
-                                 n=200 + 10 * group + i,
+                                 n=200 + 10 * theme + i,
                                  prompt_version_id=prompt_version_id)
 
 
@@ -266,9 +306,12 @@ def test_cluster_drift_two_themes_do_not_collapse(
 ) -> None:
     """Two drift-regime themes stay 2 clusters, not one attractor (f-a).
 
-    Falls on the old algorithm: with centroid update the first cluster's
-    running mean drifts until cross-theme vectors clear the threshold and
-    everything merges into a single cluster.
+    Falls on the old algorithm: with centroid update the first theme's
+    running mean drifts (its norm drops as per-member tilts cancel), and
+    its cosine to every cross-theme vector rises to 0.8835, clearing the
+    0.88 threshold — both themes merge into one 16-pain cluster. The
+    first-member similarity never compares against a mean, so cross-theme
+    pairs stay at 0.8380 and the themes remain 2 clusters.
     """
     _seed_two_drift_themes(conn, fake_embedder, prompt_version_id)
     _assert_pair_ranges(
@@ -297,10 +340,12 @@ def test_cluster_drift_two_themes_do_not_shatter(
 ) -> None:
     """Two drift-regime themes stay merged within theme, not singletons (f-b).
 
-    Falls on an over-strict fix too: intra-theme members are NOT mutually
-    nearest at raw cosine (0.85-0.92 vs threshold 0.88), so only the
-    frozen first-member anchor keeps each theme as a single cluster;
-    per-pair thresholding without it shatters into 16 singletons.
+    Guards an over-strict fix too: intra-theme member cosine is 0.8853,
+    barely above the 0.88 threshold, so anything that perturbs the
+    comparison (e.g. comparing members to a shrunk centroid, or raising
+    the threshold past 0.8853) shatters the theme into 8 singletons.
+    First-member similarity keeps the exact frozen anchor, so each theme
+    stays one cluster.
     """
     _seed_two_drift_themes(conn, fake_embedder, prompt_version_id)
 
