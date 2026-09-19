@@ -20,9 +20,10 @@ import logging
 import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import LiteralString, cast
+from typing import Final, LiteralString, cast
 
 from psycopg import Connection
 
@@ -35,20 +36,26 @@ __all__ = [
     "ClusterScoreInput",
     "LlmProviderRecord",
     "RepoError",
+    "WordstatQueryRow",
     "assign_pain_cluster",
     "create_run",
     "ensure_source",
     "finish_run",
     "get_active_llm_provider",
+    "get_run",
+    "get_wordstat_token",
     "insert_pain",
     "insert_raw_post",
     "insert_score",
     "list_cluster_input_pains",
+    "list_clusters_stale_for_wordstat",
     "list_clusters_without_score",
     "list_enabled_sources",
     "list_posts_pending_extract",
+    "list_wordstat_queries",
     "reset_cluster_assignment",
     "set_raw_post_fetch_status",
+    "set_wordstat_token",
     "table_counts",
     "update_cluster_stats",
     "update_pain_embedding",
@@ -56,6 +63,7 @@ __all__ = [
     "upsert_cluster",
     "upsert_llm_provider",
     "upsert_prompt_version",
+    "upsert_wordstat_query",
 ]
 
 
@@ -716,3 +724,135 @@ def _main(data_dir: Path | None) -> int:
 if __name__ == "__main__":
     directory = Path(sys.argv[1]) if len(sys.argv) > 1 else None
     sys.exit(_main(directory))
+
+
+# ---------------------------------------------------------------------------
+# Wordstat demand validation (task T321): phrase-frequency cache + token
+# ---------------------------------------------------------------------------
+
+#: A cached phrase-frequency check older than this is revalidated by the
+#: validate stage (owner constraint: "revalidation ~a week").
+WORDSTAT_REVALIDATE_AFTER: Final[timedelta] = timedelta(days=7)
+
+
+@dataclass(frozen=True, slots=True)
+class WordstatQueryRow:
+    """One cached Wordstat check as the dashboard card renders it."""
+
+    cluster_id: str
+    phrase: str
+    frequency: int
+    checked_at: datetime
+
+
+def upsert_wordstat_query(
+    conn: Connection, cluster_id: str, phrase: str, frequency: int
+) -> None:
+    """Cache one phrase-frequency check for ``cluster_id``.
+
+    The (cluster_id, phrase) UNIQUE constraint makes the write idempotent:
+    a validate-stage rerun UPSERTs the same row, refreshing frequency and
+    ``checked_at``, never duplicating.
+    """
+    with conn.transaction():
+        conn.execute(
+            """
+            INSERT INTO wordstat_query (cluster_id, phrase, frequency)
+            VALUES (%s::uuid, %s, %s)
+            ON CONFLICT (cluster_id, phrase) DO UPDATE SET
+                frequency = EXCLUDED.frequency,
+                checked_at = now()
+            """,
+            (cluster_id, phrase, frequency),
+        )
+
+
+def list_wordstat_queries(conn: Connection, cluster_id: str) -> list[WordstatQueryRow]:
+    """Return the cached checks for one cluster, newest check first."""
+    rows = conn.execute(
+        """
+        SELECT cluster_id::text, phrase, frequency, checked_at
+        FROM wordstat_query
+        WHERE cluster_id = %s::uuid
+        ORDER BY checked_at DESC, phrase
+        """,
+        (cluster_id,),
+    ).fetchall()
+    return [
+        WordstatQueryRow(
+            cluster_id=str(cluster_key),
+            phrase=str(phrase),
+            frequency=int(frequency),
+            checked_at=checked_at,
+        )
+        for cluster_key, phrase, frequency, checked_at in rows
+    ]
+
+
+@dataclass(frozen=True, slots=True)
+class ClusterWordstatInput:
+    """One stale cluster with the pain facts the phrase prompt needs."""
+
+    id: str
+    bodies: list[str]
+
+
+def list_clusters_stale_for_wordstat(
+    conn: Connection,
+    *,
+    revalidate_after: timedelta = WORDSTAT_REVALIDATE_AFTER,
+) -> list[ClusterWordstatInput]:
+    """Return clusters whose Wordstat checks are missing or stale.
+
+    A cluster is stale when it has NO wordstat_query rows at all, or its
+    newest ``checked_at`` is older than ``revalidate_after`` (~a week).
+    Deterministic order (created_at, id); a cluster mid-validation inside
+    a crashed run is simply picked up again by the next run — the cache
+    UPSERT makes the repeat write-safe.
+    """
+    rows = conn.execute(
+        """
+        SELECT c.id::text, array_agg(p.body ORDER BY p.created_at, p.id) AS bodies
+        FROM cluster c
+        JOIN pain p ON p.cluster_id = c.id
+        WHERE NOT EXISTS (
+            SELECT 1 FROM wordstat_query w
+            WHERE w.cluster_id = c.id
+              AND w.checked_at >= now() - %s::interval
+        )
+        GROUP BY c.id, c.created_at
+        ORDER BY c.created_at, c.id
+        """,
+        (f"{revalidate_after.days} days",),
+    ).fetchall()
+    return [
+        ClusterWordstatInput(id=str(cluster_id), bodies=[str(body) for body in bodies or []])
+        for cluster_id, bodies in rows
+    ]
+
+
+def set_wordstat_token(conn: Connection, token: str) -> None:
+    """Store the Yandex Wordstat token in the dedicated settings table.
+
+    NEVER merged into ``llm_provider`` (owner constraint): different
+    provider, different validation. Empty token clears the row's key —
+    the client factory then falls back to the fake (mock mode). The
+    secret lives only here; nothing logs or returns it.
+    """
+    with conn.transaction():
+        conn.execute(
+            """
+            INSERT INTO wordstat_settings (name, api_key)
+            VALUES ('yandex', %s)
+            ON CONFLICT (name) DO UPDATE SET api_key = EXCLUDED.api_key
+            """,
+            (token,),
+        )
+
+
+def get_wordstat_token(conn: Connection) -> str:
+    """Return the stored 'yandex' token, or '' when none is configured."""
+    row = conn.execute(
+        "SELECT api_key FROM wordstat_settings WHERE name = 'yandex'"
+    ).fetchone()
+    return str(row[0]) if row is not None else ""

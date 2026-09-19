@@ -368,3 +368,34 @@ def get_cluster_detail(conn: Connection, cluster_id: str) -> ClusterDetail | Non
         pains=pains,
         sources=tuple(sorted({pain.source_name for pain in pains})),
     )
+
+
+#: Wordstat answers shown in the cluster card (task T321).
+@dataclass(frozen=True, slots=True)
+class WordstatCard:
+    """One cached Wordstat check as the card renders it."""
+
+    phrase: str
+    frequency: int
+    checked_at: datetime
+
+
+def list_wordstat_card(conn: Connection, cluster_id: str) -> tuple[WordstatCard, ...]:
+    """Return the cluster's cached Wordstat checks, newest first.
+
+    Read-only; an empty tuple means the validate stage has not checked
+    this cluster (the card shows a quiet placeholder, not an error).
+    """
+    rows = conn.execute(
+        """
+        SELECT phrase, frequency, checked_at
+        FROM wordstat_query
+        WHERE cluster_id = %s::uuid
+        ORDER BY checked_at DESC, phrase
+        """,
+        (cluster_id,),
+    ).fetchall()
+    return tuple(
+        WordstatCard(phrase=str(phrase), frequency=int(frequency), checked_at=checked_at)
+        for phrase, frequency, checked_at in rows
+    )

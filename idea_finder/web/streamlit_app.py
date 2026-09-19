@@ -33,6 +33,7 @@ from idea_finder.web.clusters_view import (
     list_clusters,
     list_clusters_filtered,
     list_source_names,
+    list_wordstat_card,
 )
 from idea_finder.web.health_view import SourceHealthRow, health_report
 from idea_finder.web.prompts_view import render_prompts_page
@@ -254,6 +255,21 @@ def _render_cluster_card(conn: Connection, rows: list[ClusterRow]) -> None:
     header_cols[2].metric("Типы", _format_kinds(detail.kinds))
     header_cols[3].metric("Источники", str(len(detail.sources)))
     _render_feedback_row(conn, detail)
+    wordstat_rows = list_wordstat_card(conn, detail.id)
+    if wordstat_rows:
+        newest = max(row.checked_at for row in wordstat_rows)
+        st.subheader("Поисковый спрос (Яндекс Wordstat)")
+        st.caption(f"проверено {newest:%d.%m.%Y}")
+        st.dataframe(
+            pd.DataFrame(
+                {
+                    "фраза": [row.phrase for row in wordstat_rows],
+                    "частотность/мес": [row.frequency for row in wordstat_rows],
+                },
+                columns=("фраза", "частотность/мес"),
+            ),
+            hide_index=True,
+        )
     if detail.rationale_md:
         st.subheader("Обоснование")
         st.markdown(detail.rationale_md)

@@ -34,7 +34,8 @@ COMMANDS: tuple[CommandHelp, ...] = (
     ("extract", "Extract pains from collected posts via the active LLM provider."),
     ("cluster", "Embed pains and group them into clusters."),
     ("score", "Score clusters against the Russian-market rubric."),
-    ("run", "Run the full pipeline: collect, extract, cluster, score."),
+    ("validate", "Validate cluster search demand via Yandex Wordstat."),
+    ("run", "Run the full pipeline: collect, extract, cluster, score, validate."),
     ("status", "Show table counters and the state of the latest run."),
     ("captcha", "Open a headed browser for manual captcha solving on a domain."),
     ("llm-test", "Smoke-test the active LLM provider with a fixed prompt."),
@@ -45,6 +46,7 @@ _STAGES: dict[str, Callable[[Connection], pipeline.StageStats]] = {
     "extract": pipeline.run_extract,
     "cluster": pipeline.run_cluster,
     "score": pipeline.run_score,
+    "validate": pipeline.run_validate,
 }
 
 
@@ -114,6 +116,8 @@ def _cmd_status(conn: Connection) -> int:
         "pain",
         "cluster",
         "score",
+        "wordstat_query",
+        "wordstat_settings",
         "run",
         "prompt_version",
         "llm_provider",
@@ -210,7 +214,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command in _STAGES:
             return _run_stage_command((args.command,))
         if args.command == "run":
-            return _run_stage_command(("collect", "extract", "cluster", "score"))
+            return _run_stage_command(("collect", "extract", "cluster", "score", "validate"))
         if args.command == "status":
             with _open_connection() as conn:
                 return _cmd_status(conn)
