@@ -117,8 +117,8 @@ def conn(pg: PgHandle) -> Iterator[Connection]:
 def test_migration_003_applies_on_clean_database(pg: PgHandle) -> None:
     """Fresh database gets exactly versions 1, 2, 3, 4, 5."""
     with pg.get_conn() as fresh:
-        assert apply_migrations(fresh) == [1, 2, 3, 4, 5, 6]
-        assert applied_versions(fresh) == {1, 2, 3, 4, 5, 6}
+        assert apply_migrations(fresh) == [1, 2, 3, 4, 5, 6, 7]
+        assert applied_versions(fresh) == {1, 2, 3, 4, 5, 6, 7}
         columns = {
             row[0]
             for row in fresh.execute(
@@ -134,7 +134,7 @@ def test_migration_003_applies_on_clean_database(pg: PgHandle) -> None:
 def test_migration_reapply_is_noop(conn: Connection) -> None:
     """Re-running migrations changes nothing once everything is applied."""
     assert apply_migrations(conn) == []
-    assert applied_versions(conn) == {1, 2, 3, 4, 5, 6}
+    assert applied_versions(conn) == {1, 2, 3, 4, 5, 6, 7}
 
 
 def test_seed_sources_idempotent_and_default_rate(conn: Connection) -> None:

@@ -72,13 +72,14 @@ def test_run_executes_all_stages_in_order(pgdata_dir: Path) -> None:
     del pgdata_dir
     result = run_cli("run")
     assert result.returncode == 0, result.stderr
-    last4 = result.stdout.splitlines()[-4:]
-    # collect (T335), extract, cluster and score are real stages now,
-    # each printing its own stats dict on an empty database.
-    assert last4[0] == "collect: {'collected': 0, 'skipped': 0, 'warnings': 0}"
-    assert last4[1].startswith("extract: {'processed': 0,")
-    assert last4[2].startswith("cluster: {'pains': 0,")
-    assert last4[3].startswith("score: {'clusters': 0, 'scored': 0,")
+    last5 = result.stdout.splitlines()[-5:]
+    # collect (T335), extract, cluster, score and validate (T321) are real
+    # stages now, each printing its own stats dict on an empty database.
+    assert last5[0] == "collect: {'collected': 0, 'skipped': 0, 'warnings': 0}"
+    assert last5[1].startswith("extract: {'processed': 0,")
+    assert last5[2].startswith("cluster: {'pains': 0,")
+    assert last5[3].startswith("score: {'clusters': 0, 'scored': 0,")
+    assert last5[4].startswith("validate: {'clusters': 0,")
 
 
 def test_status_after_stages_reports_counters(pgdata_dir: Path) -> None:

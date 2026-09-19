@@ -28,15 +28,18 @@ import socket
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, nullcontext
 from dataclasses import replace
+from datetime import timedelta
 from typing import Final
 
+import aiolimiter
 from psycopg import Connection
 
 from idea_finder.core.embed import embed_pains
 from idea_finder.core.models import Pain, RawPost, Score
 from idea_finder.db import repo
+from idea_finder.db.repo import list_clusters_stale_for_wordstat
 from idea_finder.fetch.httpx_fetcher import HttpFetcher
-from idea_finder.llm.client import LlmError, build_llm_client, estimate_cost
+from idea_finder.llm.client import LlmClient, LlmError, build_llm_client, estimate_cost
 from idea_finder.llm.extract import (
     PROMPT_NAME,
     PROMPT_VERSION,
@@ -59,10 +62,23 @@ from idea_finder.llm.score import (
     parse_score_response,
     render_score_prompt,
 )
+from idea_finder.llm.wordstat_phrases import (
+    WORDSTAT_PROMPT_NAME,
+    WORDSTAT_PROMPT_VERSION,
+    FakeWordstatLlmClient,
+    InvalidPhrasesResponseError,
+    load_wordstat_template,
+    parse_phrases_response,
+    render_wordstat_prompt,
+)
 from idea_finder.sources.base import SourceAdapter
 from idea_finder.sources.fl_ru import FlRuAdapter
 from idea_finder.sources.gplay import GPlayAdapter
 from idea_finder.sources.habr import HabrAdapter
+from idea_finder.wordstat.client import (
+    WordstatClient,
+    build_wordstat_client,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -71,6 +87,17 @@ LOGGER = logging.getLogger(__name__)
 #: the 41-pain fix corpus in T342 — see :func:`run_cluster` for why the
 #: centroid is frozen at the first member; configuration surface pending).
 CLUSTER_THRESHOLD: Final = 0.88
+
+#: A phrase whose Wordstat frequency reaches this many monthly searches
+#: marks the cluster's demand as search-confirmed; the signal goes into
+#: the score rationale. The config surface (dashboard/tables) comes later
+#: — a module constant keeps v1 behavior reviewable.
+WORDSTAT_DEMAND_THRESHOLD: Final = 100
+
+#: Wordstat API politeness cap: 10 requests/second (task T321). Enforced
+#: per query burst through ``aiolimiter``, mirroring the fetch layer's
+#: per-domain limiting composition.
+WORDSTAT_RATE_RPS: Final[float] = 10.0
 
 type StageStats = dict[str, int]
 
@@ -568,3 +595,205 @@ def run_score(conn: Connection) -> StageStats:
         repo.update_run_stage(conn, run_id, "score", status, stats_delta=dict.fromkeys(counters, 0))
         repo.finish_run(conn, run_id)
     return dict(counters)
+
+
+#: Cluster-summary renderer shared with the score stage: the wordstat
+#: prompt receives the same human-readable facts block.
+def _wordstat_cluster_summary(
+    cluster: repo.ClusterScoreInput | object,
+    bodies: list[str],
+) -> str:
+    """Render a compact facts block for the phrase-generation prompt."""
+    lines = ["Боли кластера:"]
+    lines.extend(f"- {body}" for body in bodies)
+    return "\n".join(lines)
+
+
+def run_validate(
+    conn: Connection,
+    *,
+    wordstat_client: WordstatClient | None = None,
+    llm: LlmClient | None = None,
+    revalidate_after: timedelta | None = None,
+) -> StageStats:
+    """Validate search demand per cluster through Yandex Wordstat (T321).
+
+    For every cluster without a fresh ``wordstat_query`` cache (missing or
+    older than ``revalidate_after``, default ~a week via
+    :data:`repo.WORDSTAT_REVALIDATE_AFTER`):
+
+    1. the active LLM provider generates 3-5 search phrases for the pain
+       (through the :class:`LlmClient` port; mock mode = fake provider
+       answered by ``FakeWordstatLlmClient``, same pattern as extract/score);
+    2. each phrase goes to the Wordstat client (the port hides fake vs
+       real Yandex API), throttled to :data:`WORDSTAT_RATE_RPS` via
+       ``aiolimiter``;
+    3. the frequencies land in ``wordstat_query`` via the repo UPSERT —
+       idempotent per (cluster, phrase), so a rerun over fresh state is a
+       no-op and a crashed run resumes safely (same discipline as
+       run_collect: one failing cluster never fails the stage, and the
+       run row always closes; an ``error`` status is never overwritten by
+       ``done``).
+
+    Retries stay convergent: a phrase whose Wordstat call failed after the
+    client's internal retry schedule is counted (``api_errors``) and the
+    cluster keeps its partial cache — the next validate run re-picks the
+    cluster (cache is incomplete but stale/absent rows keep it in the
+    selection) and re-queries only what the LLM regenerates.
+
+    A cluster whose best phrase reaches :data:`WORDSTAT_DEMAND_THRESHOLD`
+    has its search demand confirmed; the stage appends the signal line to
+    the cluster's score rationale (rubric v1 untouched — the signal only
+    enriches the existing text, T321 owner constraint).
+
+    Returns ``{"clusters": N, "phrases": P, "validated": V,
+    "rejected": R, "api_errors": A, "demand_confirmed": D,
+    "rationale_updated": U}`` written to the run stats per batch.
+    """
+    if revalidate_after is not None:
+        clusters = list_clusters_stale_for_wordstat(
+            conn, revalidate_after=revalidate_after
+        )
+    else:
+        clusters = list_clusters_stale_for_wordstat(conn)
+    if not clusters:
+        LOGGER.info("run_validate: no stale clusters, nothing to do")
+        return {
+            "clusters": 0,
+            "phrases": 0,
+            "validated": 0,
+            "rejected": 0,
+            "api_errors": 0,
+            "demand_confirmed": 0,
+            "rationale_updated": 0,
+        }
+
+    repo.upsert_prompt_version(
+        conn,
+        WORDSTAT_PROMPT_NAME,
+        WORDSTAT_PROMPT_VERSION,
+        load_wordstat_template(),
+        "file",
+    )
+    run_id = repo.create_run(conn, {"validate": "running"})
+    provider = repo.get_active_llm_provider(conn)
+    if llm is not None:
+        client: LlmClient = llm
+    elif provider is not None and provider.kind == "fake":
+        # Mock mode: the fake provider answers pain texts, not phrase
+        # JSON — swap in the stage-format fake (extract/score pattern).
+        client = FakeWordstatLlmClient(model=provider.model or "fake", provider_name=provider.name)
+    else:
+        client = build_llm_client(conn)
+    wordstat: WordstatClient = (
+        wordstat_client if wordstat_client is not None else build_wordstat_client(conn)
+    )
+
+    counters = {
+        "clusters": len(clusters),
+        "phrases": 0,
+        "validated": 0,
+        "rejected": 0,
+        "api_errors": 0,
+        "demand_confirmed": 0,
+        "rationale_updated": 0,
+    }
+    status = "done"
+
+    async def _validate_all() -> None:
+        """Query every cluster's phrases under one rate limiter.
+
+        One event loop for the whole stage: the ``aiolimiter`` instance
+        must live on a single loop (re-use across loops is undefined
+        behavior), and the Wordstat port is synchronous — the limiter
+        spaces the calls, the DB writes between them run inline.
+        """
+        limiter = aiolimiter.AsyncLimiter(WORDSTAT_RATE_RPS, 1.0)
+        for cluster in clusters:
+            prompt = render_wordstat_prompt(
+                _wordstat_cluster_summary(cluster, cluster.bodies)
+            )
+            try:
+                answer = parse_phrases_response(client.complete(prompt).text)
+            except InvalidPhrasesResponseError:
+                counters["rejected"] += 1
+                continue
+            except LlmError:
+                counters["rejected"] += 1
+                continue
+            counters["phrases"] += len(answer.phrases)
+            cluster_confirmed = False
+            for phrase in answer.phrases:
+                async with limiter:
+                    try:
+                        frequency = wordstat.frequency(phrase)
+                    except Exception as e:  # noqa: BLE001 - per-phrase
+                        # isolation (run_collect pattern): one dead
+                        # phrase never fails the stage or the cluster.
+                        LOGGER.warning(
+                            "validate: wordstat query failed for %r: %s: %s",
+                            phrase,
+                            type(e).__name__,
+                            e,
+                        )
+                        counters["api_errors"] += 1
+                        continue
+                repo.upsert_wordstat_query(conn, cluster.id, phrase, frequency)
+                counters["validated"] += 1
+                if frequency >= WORDSTAT_DEMAND_THRESHOLD:
+                    cluster_confirmed = True
+            if cluster_confirmed:
+                counters["demand_confirmed"] += 1
+                if _append_wordstat_signal(conn, cluster.id):
+                    counters["rationale_updated"] += 1
+            repo.update_run_stage(
+                conn, run_id, "validate", "running", stats_delta=dict(counters)
+            )
+
+    try:
+        asyncio.run(_validate_all())
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        # Deltas were written per batch; the final update only flips the
+        # stage status (_stats_merge accumulates). Never overwrite an
+        # "error" status with "done" (run_collect/run_score discipline).
+        repo.update_run_stage(conn, run_id, "validate", status, stats_delta=dict.fromkeys(counters, 0))
+        repo.finish_run(conn, run_id)
+    return dict(counters)
+
+
+def _append_wordstat_signal(conn: Connection, cluster_id: str) -> bool:
+    """Append the confirmed-demand signal to the cluster's score rationale.
+
+    Rubric v1 weights stay untouched (owner constraint): the signal is a
+    rationale-only annotation. Returns False when the cluster has no score
+    row yet (the next run_score will then see only cached wordstat rows —
+    the signal lands after the next scoring pass) or the signal is already
+    there (idempotent: a revalidated cluster must not stack duplicates).
+    """
+    signal = (
+        "\n\n**Поисковый спрос подтверждён** (Яндекс Wordstat: частотность "
+        f"≥ {WORDSTAT_DEMAND_THRESHOLD}/мес по ключевой фразе)."
+    )
+    with conn.transaction():
+        row = conn.execute(
+            """
+            SELECT s.rationale_md
+            FROM score s
+            WHERE s.cluster_id = %s::uuid
+            FOR UPDATE
+            """,
+            (cluster_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        rationale = str(row[0])
+        if "Поисковый спрос подтверждён" in rationale:
+            return False
+        conn.execute(
+            "UPDATE score SET rationale_md = %s WHERE cluster_id = %s::uuid",
+            (rationale + signal, cluster_id),
+        )
+    return True
